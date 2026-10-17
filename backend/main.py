@@ -3,8 +3,10 @@ from fastapi import FastAPI, Query, HTTPException
 from typing import Optional
 import json
 import time
+import uuid
+from urllib.parse import quote
 
-from utils.crypto import generate_signature, get_client_info
+from utils.crypto import generate_signature, get_client_info_json
 from utils.extractor import clean_stream_list
 
 app = FastAPI(title="Movie Proxy API")
@@ -12,23 +14,31 @@ app = FastAPI(title="Movie Proxy API")
 OFFICIAL_BASE_URL = "https://api.inmoviebox.com"
 DEFAULT_HOST = "api6.aoneroom.com"
 
-# Global state for token caching
-class TokenManager:
+# Global state for server session
+class AppSession:
     def __init__(self):
+        # Default guest token from Android source
         self.token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjcwNjU5NDg0MTAyMTM4MTYyMzIsInV0cCI6MSwiZXhwIjoxNzkxNzMyMjMzLCJpYXQiOjE3ODM5NTU5MzN9.7iyEzTj4vWAbOF0oXwNnZ0p3Nc1QaO6K9eMiGFyVfGs"
+        self.device_id = uuid.uuid4().hex
         self.last_refreshed = 0
 
-token_manager = TokenManager()
+session = AppSession()
 
 async def bootstrap_token():
-    """Fetches a fresh guest token from the official API headers."""
+    """Mirror of Android's bootstrapGuestToken()"""
     endpoint = "/wefeed-mobile-bff/tab-operating"
+    # Exact params from app
     params = {"host": "api.inmoviebox.com", "page": "1", "pageSize": "24", "tabId": "1"}
-    query_str = "?" + "&".join([f"{k}={v}" for k, v in sorted(params.items())])
-    full_url_for_sig = f"{endpoint}{query_str}"
     
-    timestamp, signature, client_token = generate_signature("GET", full_url_for_sig)
-    client_info = get_client_info()
+    # Sort and build query string manually to match OkHttp behavior
+    sorted_keys = sorted(params.keys())
+    query_parts = [f"{k}={quote(str(params[k]))}" for k in sorted_keys]
+    query_str = "?" + "&".join(query_parts)
+    
+    full_path_for_sig = f"{endpoint}{query_str}"
+    
+    timestamp, signature, client_token = generate_signature("GET", full_path_for_sig)
+    client_info = get_client_info_json(session.device_id)
     
     headers = {
         "User-Agent": "MovieBoxPro/16.2.1 (Android 14; com.community.mbox.in)",
@@ -39,23 +49,26 @@ async def bootstrap_token():
         "X-Client-Token": client_token,
         "x-tr-signature": signature,
         "X-Client-Info": client_info,
-        "X-Play-Mode": "2"
+        "X-Play-Mode": "2",
+        "X-Client-Status": "1"
     }
 
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(f"{OFFICIAL_BASE_URL}{endpoint}", params=params, headers=headers)
+            # Token is in x-user or X-User header
             raw_token = response.headers.get("x-user") or response.headers.get("X-User")
             if raw_token:
                 if raw_token.startswith("{"):
                     data = json.loads(raw_token)
-                    token_manager.token = data.get("token", token_manager.token)
+                    session.token = data.get("token", session.token)
                 else:
-                    token_manager.token = raw_token
-                token_manager.last_refreshed = time.time()
+                    session.token = raw_token
+                session.last_refreshed = time.time()
+                print(f"Token refreshed successfully using device {session.device_id}")
                 return True
         except Exception as e:
-            print(f"Token bootstrap failed: {e}")
+            print(f"Token bootstrap exception: {e}")
     return False
 
 async def make_official_request(method: str, endpoint: str, params: dict = None, body: dict = None, retry_on_401=True):
@@ -66,13 +79,17 @@ async def make_official_request(method: str, endpoint: str, params: dict = None,
     if "host" not in params:
         params["host"] = DEFAULT_HOST
         
-    query_str = "?" + "&".join([f"{k}={v}" for k, v in sorted(params.items())]) if params else ""
-    full_url_for_sig = f"{endpoint}{query_str}"
+    # Manual query string construction for signature parity
+    sorted_keys = sorted(params.keys())
+    query_parts = [f"{k}={quote(str(params[k]))}" for k in sorted_keys]
+    query_str = "?" + "&".join(query_parts) if query_parts else ""
     
-    body_bytes = json.dumps(body).encode('utf-8') if body else b""
+    full_path_for_sig = f"{endpoint}{query_str}"
     
-    timestamp, signature, client_token = generate_signature(method, full_url_for_sig, body_bytes)
-    client_info = get_client_info()
+    body_bytes = json.dumps(body, separators=(',', ':')).encode('utf-8') if body else b""
+    
+    timestamp, signature, client_token = generate_signature(method, full_path_for_sig, body_bytes)
+    client_info = get_client_info_json(session.device_id)
     
     headers = {
         "User-Agent": "MovieBoxPro/16.2.1 (Android 14; com.community.mbox.in)",
@@ -87,7 +104,7 @@ async def make_official_request(method: str, endpoint: str, params: dict = None,
         "X-Play-Mode": "2",
         "X-Client-Info": client_info,
         "X-Client-Status": "1",
-        "Authorization": f"Bearer {token_manager.token}"
+        "Authorization": f"Bearer {session.token}"
     }
     
     async with httpx.AsyncClient() as client:
@@ -98,35 +115,31 @@ async def make_official_request(method: str, endpoint: str, params: dict = None,
                 response = await client.get(url, params=params, headers=headers)
                 
             if response.status_code == 401 and retry_on_401:
-                print("401 detected, refreshing token...")
+                print("401 detected, retrying with fresh token...")
                 if await bootstrap_token():
                     return await make_official_request(method, endpoint, params, body, retry_on_401=False)
             
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=str(e))
+            # If still 401, return detailed error
+            raise HTTPException(status_code=e.response.status_code, detail=f"Official API Error: {response.text}")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "device": session.device_id}
 
 @app.get("/trending")
 async def get_trending(page: int = 1, pageSize: int = 24):
     data = await make_official_request("POST", "/wefeed-mobile-bff/subject-api/trending/v2", body={})
-    # Extract items and flatten
     items = data.get("data", {}).get("list", []) or data.get("data", {}).get("items", []) or []
     return {"code": 0, "data": items}
 
 @app.get("/search")
 async def search(q: str, page: int = 1):
-    body = {
-        "keyword": q,
-        "page": page,
-        "pageSize": 20
-    }
+    body = {"keyword": q, "page": page, "pageSize": 20}
     data = await make_official_request("POST", "/wefeed-mobile-bff/subject-api/search", body=body)
     items = data.get("data", {}).get("list", []) or data.get("data", {}).get("items", []) or []
     return {"code": 0, "data": {"items": items}}
@@ -144,23 +157,14 @@ async def get_stream(
     quality: str = "720p",
     resource_id: Optional[str] = None
 ):
-    params = {
-        "subjectId": subject_id,
-        "se": season,
-        "ep": episode,
-        "quality": quality
-    }
+    params = {"subjectId": subject_id, "se": season, "ep": episode, "quality": quality}
     if resource_id:
         params["resourceId"] = resource_id
         
     data = await make_official_request("GET", "/wefeed-mobile-bff/subject-api/play-info", params=params)
-    
-    # Process and clean streams
     raw_streams = data.get("data", {}).get("streamList", []) or data.get("data", {}).get("streams", []) or []
     global_cookie = data.get("signCookie", "")
-    
     cleaned = clean_stream_list(raw_streams, global_cookie)
-    
     first = cleaned[0] if cleaned else {}
     
     return {
@@ -169,7 +173,7 @@ async def get_stream(
         "quality": quality,
         "cookie": first.get("cookie", global_cookie),
         "streamList": cleaned,
-        "subtitles": [] # Subtitle logic can be added similarly
+        "subtitles": []
     }
 
 if __name__ == "__main__":
