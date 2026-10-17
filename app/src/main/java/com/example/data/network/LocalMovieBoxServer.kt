@@ -1334,12 +1334,13 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
         val reversed = timestamp.reversed()
         val clientToken = "$timestamp,${md5(reversed)}"
 
+        val apiHost = prefs.getString("api_host_key", "api6.aoneroom.com") ?: "api6.aoneroom.com"
         val baseUrl = "https://api.inmoviebox.com"
         val fullUrlWithoutQuery = "$baseUrl$endpoint"
 
         val urlBuilder = fullUrlWithoutQuery.toHttpUrl().newBuilder()
         if (!queryParams.containsKey("host")) {
-            urlBuilder.addQueryParameter("host", "api.inmoviebox.com")
+            urlBuilder.addQueryParameter("host", apiHost)
         }
         queryParams.forEach { (k, v) ->
             urlBuilder.addQueryParameter(k, v)
