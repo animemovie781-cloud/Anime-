@@ -2,6 +2,7 @@ import httpx
 from fastapi import FastAPI, Query, HTTPException
 from typing import Optional
 import json
+import time
 
 from utils.crypto import generate_signature, get_client_info
 from utils.extractor import clean_stream_list
@@ -11,7 +12,53 @@ app = FastAPI(title="Movie Proxy API")
 OFFICIAL_BASE_URL = "https://api.inmoviebox.com"
 DEFAULT_HOST = "api6.aoneroom.com"
 
-async def make_official_request(method: str, endpoint: str, params: dict = None, body: dict = None):
+# Global state for token caching
+class TokenManager:
+    def __init__(self):
+        self.token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjcwNjU5NDg0MTAyMTM4MTYyMzIsInV0cCI6MSwiZXhwIjoxNzkxNzMyMjMzLCJpYXQiOjE3ODM5NTU5MzN9.7iyEzTj4vWAbOF0oXwNnZ0p3Nc1QaO6K9eMiGFyVfGs"
+        self.last_refreshed = 0
+
+token_manager = TokenManager()
+
+async def bootstrap_token():
+    """Fetches a fresh guest token from the official API headers."""
+    endpoint = "/wefeed-mobile-bff/tab-operating"
+    params = {"host": "api.inmoviebox.com", "page": "1", "pageSize": "24", "tabId": "1"}
+    query_str = "?" + "&".join([f"{k}={v}" for k, v in sorted(params.items())])
+    full_url_for_sig = f"{endpoint}{query_str}"
+    
+    timestamp, signature, client_token = generate_signature("GET", full_url_for_sig)
+    client_info = get_client_info()
+    
+    headers = {
+        "User-Agent": "MovieBoxPro/16.2.1 (Android 14; com.community.mbox.in)",
+        "Accept": "application/json",
+        "X-Sign-Version": "2.0",
+        "appid": "4U01pxRu278GqCZKY9",
+        "X-Timestamp": timestamp,
+        "X-Client-Token": client_token,
+        "x-tr-signature": signature,
+        "X-Client-Info": client_info,
+        "X-Play-Mode": "2"
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(f"{OFFICIAL_BASE_URL}{endpoint}", params=params, headers=headers)
+            raw_token = response.headers.get("x-user") or response.headers.get("X-User")
+            if raw_token:
+                if raw_token.startswith("{"):
+                    data = json.loads(raw_token)
+                    token_manager.token = data.get("token", token_manager.token)
+                else:
+                    token_manager.token = raw_token
+                token_manager.last_refreshed = time.time()
+                return True
+        except Exception as e:
+            print(f"Token bootstrap failed: {e}")
+    return False
+
+async def make_official_request(method: str, endpoint: str, params: dict = None, body: dict = None, retry_on_401=True):
     url = f"{OFFICIAL_BASE_URL}{endpoint}"
     if params is None:
         params = {}
@@ -19,8 +66,7 @@ async def make_official_request(method: str, endpoint: str, params: dict = None,
     if "host" not in params:
         params["host"] = DEFAULT_HOST
         
-    # Construct final URL for signature generation (with query params)
-    query_str = "?" + "&".join([f"{k}={v}" for k, v in params.items()]) if params else ""
+    query_str = "?" + "&".join([f"{k}={v}" for k, v in sorted(params.items())]) if params else ""
     full_url_for_sig = f"{endpoint}{query_str}"
     
     body_bytes = json.dumps(body).encode('utf-8') if body else b""
@@ -41,7 +87,7 @@ async def make_official_request(method: str, endpoint: str, params: dict = None,
         "X-Play-Mode": "2",
         "X-Client-Info": client_info,
         "X-Client-Status": "1",
-        "Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjcwNjU5NDg0MTAyMTM4MTYyMzIsInV0cCI6MSwiZXhwIjoxNzkxNzMyMjMzLCJpYXQiOjE3ODM5NTU5MzN9.7iyEzTj4vWAbOF0oXwNnZ0p3Nc1QaO6K9eMiGFyVfGs" # Guest Token
+        "Authorization": f"Bearer {token_manager.token}"
     }
     
     async with httpx.AsyncClient() as client:
@@ -51,6 +97,11 @@ async def make_official_request(method: str, endpoint: str, params: dict = None,
             else:
                 response = await client.get(url, params=params, headers=headers)
                 
+            if response.status_code == 401 and retry_on_401:
+                print("401 detected, refreshing token...")
+                if await bootstrap_token():
+                    return await make_official_request(method, endpoint, params, body, retry_on_401=False)
+            
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:

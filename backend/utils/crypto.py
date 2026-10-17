@@ -55,7 +55,11 @@ def generate_signature(method: str, url_str: str, body_bytes: bytes = b"") -> tu
     
     return timestamp, signature_header, client_token
 
-def get_client_info(region: str = "IN", sp_code: str = "40401") -> str:
+def get_client_info(region: str = "IN", sp_code: str = "40401", device_id: str = None) -> str:
+    if not device_id:
+        import uuid
+        device_id = uuid.uuid4().hex
+    
     timezone = "Asia/Kolkata" if region == "IN" else "America/New_York"
     info = {
         "package_name": "com.movieboxpro.android",
@@ -64,7 +68,7 @@ def get_client_info(region: str = "IN", sp_code: str = "40401") -> str:
         "os": "android",
         "os_version": "12",
         "install_ch": "googleplay",
-        "device_id": "8c5da15be6ca34e724a27bc102cd8bcf", # Generic ID
+        "device_id": device_id,
         "install_store": "googleplay",
         "gaid": "",
         "brand": "google",
