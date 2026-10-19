@@ -304,11 +304,10 @@ class MovieRepository(
                 val animeProvider = AnimeDubHindiProvider()
                 val animeStreams = animeProvider.resolveStreamForTitle(title, season, episode)
                 if (animeStreams.isNotEmpty()) {
-                    val combinedStreams = if (basePlayInfo.streamList.isEmpty() || resourceId == "animedubhindi") {
-                        animeStreams + basePlayInfo.streamList
-                    } else {
-                        basePlayInfo.streamList + animeStreams
-                    }.distinctBy { it.url }
+                    val validBaseStreams = basePlayInfo.streamList.filter { 
+                        !it.url.contains("macdn.aoneroom.com") && !it.url.contains("b164fbfb4347792950bdfbfb563d39d9")
+                    }
+                    val combinedStreams = (animeStreams + validBaseStreams).distinctBy { it.url }
                     return@withContext PlayInfo(combinedStreams, basePlayInfo.subTitleList)
                 }
             } catch (e: Exception) {

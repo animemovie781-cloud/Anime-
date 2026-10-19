@@ -2681,6 +2681,33 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                                     )
                                 }
                                 
+                                // Direct Quality Selector Button in player overlay
+                                IconButton(onClick = {
+                                    activeSheet = "quality"
+                                }) {
+                                    val qText = viewModel.selectedStream?.quality ?: "HQ"
+                                    val shortQ = when {
+                                        qText.contains("1080") -> "1080p"
+                                        qText.contains("720") -> "720p"
+                                        qText.contains("480") -> "480p"
+                                        qText.contains("4k", ignoreCase = true) -> "4K"
+                                        else -> "HD"
+                                    }
+                                    Surface(
+                                        color = Color(0xFF115E59).copy(alpha = 0.85f),
+                                        shape = RoundedCornerShape(4.dp),
+                                        border = BorderStroke(1.dp, Color(0xFF2DD4BF))
+                                    ) {
+                                        Text(
+                                            text = shortQ,
+                                            color = Color.White,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+
                                 IconButton(onClick = {
                                     activeSheet = "player_settings"
                                 }) {
@@ -3017,7 +3044,14 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                                     "language" -> subject.resourceDetectors
                                     "season" -> viewModel.seasonsList
                                     "subtitle" -> listOf("None") + playInfo.subTitleList.map { it.language }
-                                    "quality" -> playInfo.streamList
+                                    "quality" -> {
+                                        val list = playInfo.streamList
+                                        if (list.isEmpty() && viewModel.selectedStream != null) {
+                                            listOf(viewModel.selectedStream!!)
+                                        } else {
+                                            list
+                                        }
+                                    }
                                     "speed" -> listOf("0.5x", "0.75x", "1.0x (Normal)", "1.25x", "1.5x", "2.0x")
                                     "episodes" -> viewModel.episodesList
                                     else -> emptyList()
@@ -3071,6 +3105,8 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                                                                 }
                                                             }
                                                             "quality" -> {
+                                                                val pos = exoPlayer.currentPosition
+                                                                if (pos > 0) viewModel.playbackProgressMs = pos
                                                                 viewModel.selectedStream = item as com.example.data.model.StreamItem
                                                             }
                                                             "speed" -> {
@@ -3104,7 +3140,14 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                                                             "language" -> (item as com.example.data.model.ResourceDetector).name
                                                             "season" -> "Season ${(item as Int).toString().padStart(2, '0')}"
                                                             "subtitle" -> item as String
-                                                            "quality" -> (item as com.example.data.model.StreamItem).quality
+                                                            "quality" -> {
+                                                                val s = item as com.example.data.model.StreamItem
+                                                                if (s.size.isNotBlank() && s.size != "Dynamic" && s.size != "HD") {
+                                                                    "${s.quality} • ${s.size}"
+                                                                } else {
+                                                                    s.quality
+                                                                }
+                                                            }
                                                             "speed" -> item as String
                                                             "episodes" -> (item as com.example.data.model.Episode).episodeNumber.toString().padStart(2, '0')
                                                             else -> ""
@@ -3125,9 +3168,9 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                         }
                     } else {
 
-                        // Resource and Season selectors section
+                        // Resource, Quality and Season selectors section
                         Text(
-                            text = "Resource / Season",
+                            text = "Audio Provider / Quality / Season",
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold,
                             color = TextSecondary,
@@ -3135,8 +3178,11 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                         )
 
                         Row(
-                            horizontalArrangement = Arrangement.spacedBy(12.dp),
-                            modifier = Modifier.padding(bottom = 16.dp)
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                                .padding(bottom = 16.dp)
                         ) {
                             // Resource trigger button
                             if (subject.resourceDetectors.isNotEmpty()) {
@@ -3152,6 +3198,27 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                                         fontSize = 13.sp
                                     )
                                 }
+                            }
+
+                            // Quality trigger button (Directly accessible below player!)
+                            Button(
+                                onClick = { activeSheet = "quality" },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = if (viewModel.selectedStream?.quality?.contains("AnimeDub", ignoreCase = true) == true)
+                                        Color(0xFF134E4A) else Color(0xFF2D2D30)
+                                ),
+                                shape = RoundedCornerShape(8.dp),
+                                border = if (viewModel.selectedStream?.quality?.contains("AnimeDub", ignoreCase = true) == true)
+                                    BorderStroke(1.dp, Color(0xFF2DD4BF)) else null
+                            ) {
+                                val currentQ = viewModel.selectedStream?.quality ?: "Quality"
+                                Text(
+                                    text = "$currentQ ▾",
+                                    color = if (viewModel.selectedStream?.quality?.contains("AnimeDub", ignoreCase = true) == true)
+                                        Color(0xFF2DD4BF) else Color.White,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
                             }
 
                             // Season trigger button (only for TV Shows)
@@ -3401,7 +3468,14 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                                         "language" -> subject.resourceDetectors
                                         "season" -> viewModel.seasonsList
                                         "subtitle" -> listOf("None") + playInfo.subTitleList.map { it.language }
-                                        "quality" -> playInfo.streamList
+                                        "quality" -> {
+                                            val list = playInfo.streamList
+                                            if (list.isEmpty() && viewModel.selectedStream != null) {
+                                                listOf(viewModel.selectedStream!!)
+                                            } else {
+                                                list
+                                            }
+                                        }
                                         "speed" -> listOf("0.5x", "0.75x", "1.0x (Normal)", "1.25x", "1.5x", "2.0x")
                                         "episodes" -> viewModel.episodesList
                                         else -> emptyList()
@@ -3456,6 +3530,8 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                                                         }
                                                     }
                                                     "quality" -> {
+                                                        val pos = exoPlayer.currentPosition
+                                                        if (pos > 0) viewModel.playbackProgressMs = pos
                                                         viewModel.selectedStream = item as com.example.data.model.StreamItem
                                                     }
                                                     "speed" -> {
@@ -3489,7 +3565,14 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                                                     "language" -> (item as com.example.data.model.ResourceDetector).name
                                                     "season" -> "Season ${(item as Int).toString().padStart(2, '0')}"
                                                     "subtitle" -> item as String
-                                                    "quality" -> (item as com.example.data.model.StreamItem).quality
+                                                    "quality" -> {
+                                                        val s = item as com.example.data.model.StreamItem
+                                                        if (s.size.isNotBlank() && s.size != "Dynamic" && s.size != "HD") {
+                                                            "${s.quality} • ${s.size}"
+                                                        } else {
+                                                            s.quality
+                                                        }
+                                                    }
                                                     "speed" -> item as String
                                                     "episodes" -> (item as com.example.data.model.Episode).episodeNumber.toString().padStart(2, '0')
                                                     else -> ""

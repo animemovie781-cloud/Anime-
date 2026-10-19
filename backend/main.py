@@ -226,27 +226,31 @@ async def get_stream(
     except Exception as e:
         print(f"Official stream fetch error: {e}")
 
-    # Fallback to AnimeDubHindi if empty or anime requested
-    if not cleaned:
+    # Integrate AnimeDubHindi if empty or animedubhindi requested or anime title
+    if not cleaned or resource_id == "animedubhindi" or (resource_id and "hindi" in resource_id.lower()):
         try:
-            # Query title from detail if available
             detail = await get_detail(subject_id)
             title = detail.get("data", {}).get("title") or detail.get("data", {}).get("name") or subject_id
-            adh_results = await animedub_adapter.search(title)
+            adh_results = await animedub_adapter.search(title, season=season)
             if adh_results:
                 matched_adh = adh_results[0]
                 adh_links = await animedub_adapter.get_links(matched_adh["url"], season=season, episode=episode)
+                adh_formatted = []
                 for l in adh_links:
-                    cleaned.append({
-                        "quality": l.get("quality", "1080p"),
+                    adh_formatted.append({
+                        "quality": l.get("quality", "1080p (AnimeDubHindi)"),
                         "url": l.get("url", ""),
                         "cookie": "",
                         "size": "Dynamic",
                         "provider": "Animedubhindi",
-                        "language": "Hindi"
+                        "language": "Hindi Dub"
                     })
+                if resource_id == "animedubhindi":
+                    cleaned = adh_formatted + cleaned
+                else:
+                    cleaned.extend(adh_formatted)
         except Exception as e:
-            print(f"AnimeDubHindi fallback error: {e}")
+            print(f"AnimeDubHindi stream integration error: {e}")
 
     first = cleaned[0] if cleaned else {}
     

@@ -666,6 +666,22 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
                                 "totalEpisode" to (d["totalEpisode"] ?: 0)
                             ))
                         }
+
+                        // Add AnimeDubHindi as a top-level provider/dub detector for anime titles
+                        val nameStr = (mutableMapped["name"] ?: mutableMapped["title"] ?: "").toString()
+                        val genresStr = (mutableMapped["genres"] as? List<*>)?.joinToString(" ") ?: ""
+                        val isAnime = genresStr.contains("anime", ignoreCase = true) ||
+                                genresStr.contains("animation", ignoreCase = true) ||
+                                nameStr.contains("anime", ignoreCase = true) ||
+                                nameStr.contains("dub", ignoreCase = true)
+                        if (isAnime) {
+                            consolidatedDetectors.add(0, mapOf(
+                                "resourceId" to "animedubhindi",
+                                "name" to "AnimeDubHindi (Hindi Dub)",
+                                "totalEpisode" to 0
+                            ))
+                        }
+
                         mutableMapped["resourceDetectors"] = consolidatedDetectors
 
                         val responseBody = mapOf(
@@ -1046,7 +1062,14 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
 
                         // Fallback / Integration with AnimeDubHindiProvider
                         val resolvedTitle = (detailData?.get("title") ?: detailData?.get("name"))?.toString() ?: ""
-                        if ((cleanedStreams.isEmpty() || resourceId == "animedubhindi" || resourceId?.contains("hindi", ignoreCase = true) == true) && resolvedTitle.isNotBlank()) {
+                        val detailGenres = (detailData?.get("genres") as? List<*>)?.joinToString(" ") ?: ""
+                        val isAnimeContent = detailGenres.contains("anime", ignoreCase = true) ||
+                                detailGenres.contains("animation", ignoreCase = true) ||
+                                resolvedTitle.contains("anime", ignoreCase = true) ||
+                                resolvedTitle.contains("dub", ignoreCase = true) ||
+                                resourceId == "animedubhindi"
+
+                        if ((cleanedStreams.isEmpty() || isAnimeContent || resourceId == "animedubhindi" || resourceId?.contains("hindi", ignoreCase = true) == true) && resolvedTitle.isNotBlank()) {
                             try {
                                 val animeProvider = AnimeDubHindiProvider(okHttpClient)
                                 val animeStreams = kotlinx.coroutines.runBlocking {
@@ -1056,14 +1079,19 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
                                         episode.toIntOrNull() ?: 1
                                     )
                                 }
-                                for (asItem in animeStreams) {
-                                    cleanedStreams.add(mapOf(
+                                val formattedStreams = animeStreams.map { asItem ->
+                                    mapOf(
                                         "quality" to asItem.quality,
                                         "url" to asItem.url,
                                         "cookie" to asItem.cookie,
                                         "size" to asItem.size,
                                         "provider" to "AnimeDubHindi"
-                                    ))
+                                    )
+                                }
+                                if (resourceId == "animedubhindi") {
+                                    cleanedStreams.addAll(0, formattedStreams)
+                                } else {
+                                    cleanedStreams.addAll(formattedStreams)
                                 }
                             } catch (e: Exception) {
                                 Log.w("LocalMovieBoxServer", "AnimeDubHindi stream fetch failed for $resolvedTitle: ${e.message}")

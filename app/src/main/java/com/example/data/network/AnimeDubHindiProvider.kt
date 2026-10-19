@@ -3,7 +3,10 @@ package com.example.data.network
 import android.util.Log
 import com.example.data.model.StreamItem
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.util.concurrent.TimeUnit
@@ -15,10 +18,16 @@ data class AnimeDubSearchResult(
     val poster: String? = null
 )
 
+private data class RawQualityLink(
+    val quality: String,
+    val size: String,
+    val url: String
+)
+
 class AnimeDubHindiProvider(
     private val client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(10, TimeUnit.SECONDS)
+        .connectTimeout(6, TimeUnit.SECONDS)
+        .readTimeout(6, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 ) {
@@ -31,11 +40,16 @@ class AnimeDubHindiProvider(
         )
     }
 
-    suspend fun search(query: String): List<AnimeDubSearchResult> = withContext(Dispatchers.IO) {
+    suspend fun search(query: String, season: Int = 1): List<AnimeDubSearchResult> = withContext(Dispatchers.IO) {
         val cleanQuery = query.trim()
         if (cleanQuery.isBlank()) return@withContext emptyList()
 
         val queries = mutableListOf<String>()
+        // Prioritize Season-specific query if season > 1
+        if (season > 1) {
+            queries.add("$cleanQuery Season $season")
+            queries.add("$cleanQuery S$season")
+        }
         queries.add(cleanQuery)
         if (cleanQuery.contains(":")) {
             queries.add(cleanQuery.substringBefore(":").trim())
@@ -93,7 +107,6 @@ class AnimeDubHindiProvider(
 
         while (matcher.find()) {
             val articleHtml = matcher.group(1) ?: continue
-            // Extract title and href from h2 or h3
             val aPattern = Pattern.compile("<h[23][^>]*>\\s*<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", Pattern.DOTALL)
             val aMatcher = aPattern.matcher(articleHtml)
             if (aMatcher.find()) {
@@ -101,7 +114,6 @@ class AnimeDubHindiProvider(
                 val rawTitle = aMatcher.group(2) ?: ""
                 val cleanTitle = rawTitle.replace(Regex("<[^>]+>"), "").replace("&amp;", "&").trim()
 
-                // Extract poster
                 val imgPattern = Pattern.compile("<img[^>]*src=[\"']([^\"']+)[\"']", Pattern.DOTALL)
                 val imgMatcher = imgPattern.matcher(articleHtml)
                 val poster = if (imgMatcher.find()) imgMatcher.group(1) else null
@@ -112,7 +124,7 @@ class AnimeDubHindiProvider(
             }
         }
 
-        // Fallback: match any anchor with class or rel referencing post
+        // Fallback: match any anchor with anime/hindi
         if (results.isEmpty()) {
             val genericPattern = Pattern.compile("<a[^>]*href=[\"'](https?://[^\"']+(?:anime|hindi|season|episode|movie)[^\"']*)[\"'][^>]*>(.*?)</a>", Pattern.DOTALL)
             val genMatcher = genericPattern.matcher(html)
@@ -144,129 +156,221 @@ class AnimeDubHindiProvider(
             if (!response.isSuccessful) return@withContext emptyList()
             val html = response.body?.string() ?: ""
 
-            val rawLinks = mutableListOf<String>()
+            // 1. Check for intermediate adhlinks.com page
+            val adhLinkPattern = Pattern.compile("href=[\"'](https?://[^\"']*adhlinks\\.com/[^\"']+)[\"']")
+            val adhMatcher = adhLinkPattern.matcher(html)
+            val adhUrl = if (adhMatcher.find()) adhMatcher.group(1) else null
 
-            // Find all anchor links
-            val linkPattern = Pattern.compile("<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", Pattern.DOTALL)
-            val matcher = linkPattern.matcher(html)
-            while (matcher.find()) {
-                val href = matcher.group(1) ?: continue
-                val text = matcher.group(2) ?: ""
-                if (isTargetStreamHost(href)) {
-                    rawLinks.add(href)
-                }
-            }
-
-            // Check intermediate adhlinks if present
-            val adhLinks = rawLinks.filter { it.contains("adhlinks.com") }
-            for (adhUrl in adhLinks.take(3)) {
+            val targetHtml = if (adhUrl != null) {
                 try {
                     val adhReq = Request.Builder()
                         .url(adhUrl)
                         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0")
                         .build()
                     val adhRes = client.newCall(adhReq).execute()
-                    if (adhRes.isSuccessful) {
-                        val adhHtml = adhRes.body?.string() ?: ""
-                        val adhMatcher = linkPattern.matcher(adhHtml)
-                        while (adhMatcher.find()) {
-                            val innerHref = adhMatcher.group(1) ?: continue
-                            if (isDirectStreamOrCloudHost(innerHref)) {
-                                rawLinks.add(innerHref)
-                            }
-                        }
-                    }
+                    if (adhRes.isSuccessful) adhRes.body?.string() ?: html else html
                 } catch (e: Exception) {
-                    Log.w(TAG, "Error resolving adhlink $adhUrl: ${e.message}")
+                    html
                 }
+            } else {
+                html
             }
 
-            // Now resolve HubCloud / Direct Cloudflare / GDFlix / Pixeldrain
-            val distinctLinks = rawLinks.distinct().filter { isDirectStreamOrCloudHost(it) }
+            // 2. Extract qualities and links for the requested episode
+            val rawQualities = extractQualitiesFromHtml(targetHtml, episode)
+            Log.i(TAG, "Extracted ${rawQualities.size} raw quality links for episode $episode from $postUrl")
 
-            for (link in distinctLinks) {
-                // If link is HubCloud, attempt resolving direct download / stream link
-                if (link.contains("hubcloud.ist/drive/")) {
-                    val directStreams = resolveHubCloudStream(link)
-                    for (ds in directStreams) {
-                        streamItems.add(ds)
+            // 3. Resolve direct streams concurrently with timeout
+            val deferredList = rawQualities.map { rql ->
+                async(Dispatchers.IO) {
+                    if (rql.url.contains("hubcloud.ist/drive/")) {
+                        val resolved = withTimeoutOrNull(4000L) {
+                            resolveHubCloudDirectStream(rql.url)
+                        }
+                        if (resolved != null && resolved.isNotEmpty()) {
+                            resolved.map { ds ->
+                                StreamItem(
+                                    quality = "${rql.quality} (AnimeDubHindi)",
+                                    url = ds,
+                                    size = rql.size,
+                                    cookie = ""
+                                )
+                            }
+                        } else {
+                            listOf(
+                                StreamItem(
+                                    quality = "${rql.quality} (AnimeDubHindi)",
+                                    url = rql.url,
+                                    size = rql.size,
+                                    cookie = ""
+                                )
+                            )
+                        }
+                    } else {
+                        listOf(
+                            StreamItem(
+                                quality = "${rql.quality} (AnimeDubHindi)",
+                                url = rql.url,
+                                size = rql.size,
+                                cookie = ""
+                            )
+                        )
                     }
-                } else if (link.contains("pixeldrain") || link.contains("gdflix") || link.contains("r2.cloudflarestorage")) {
-                    val quality = if (link.contains("1080")) "1080p (Hindi Dub)"
-                        else if (link.contains("720")) "720p (Hindi Dub)"
-                        else if (link.contains("480")) "480p (Hindi Dub)"
-                        else "HD (Hindi Dub)"
-                    streamItems.add(
-                        StreamItem(
-                            quality = quality,
-                            url = link,
-                            size = "HD",
-                            cookie = ""
-                        )
-                    )
                 }
             }
 
-            // If no streamItems resolved from deep links yet, wrap distinctLinks as stream options
-            if (streamItems.isEmpty()) {
-                for (link in distinctLinks.take(5)) {
-                    val quality = if (link.contains("1080")) "1080p (AnimeDubHindi)"
-                        else if (link.contains("720")) "720p (AnimeDubHindi)"
-                        else if (link.contains("480")) "480p (AnimeDubHindi)"
-                        else "HD (AnimeDubHindi)"
-                    streamItems.add(
-                        StreamItem(
-                            quality = quality,
-                            url = link,
-                            size = "Dynamic",
-                            cookie = ""
-                        )
-                    )
+            val resolvedGroups = deferredList.awaitAll()
+            for (group in resolvedGroups) {
+                for (item in group) {
+                    if (!streamItems.any { it.url == item.url }) {
+                        streamItems.add(item)
+                    }
                 }
             }
+
+            // If still empty, check any direct links in html
+            if (streamItems.isEmpty()) {
+                val directPattern = Pattern.compile("href=[\"'](https?://[^\"']*(?:hubcloud|pixeldrain|gdflix|cloudflarestorage|m3u8|mp4)[^\"']*)[\"']")
+                val dMatcher = directPattern.matcher(targetHtml)
+                var idx = 0
+                while (dMatcher.find() && idx < 3) {
+                    val url = dMatcher.group(1) ?: continue
+                    val q = if (idx == 0) "1080p (AnimeDubHindi)" else if (idx == 1) "720p (AnimeDubHindi)" else "480p (AnimeDubHindi)"
+                    streamItems.add(StreamItem(quality = q, url = url, size = "HD", cookie = ""))
+                    idx++
+                }
+            }
+
+            // Ensure distinct qualities are sorted 1080p -> 720p -> 480p
+            streamItems.sortByDescending {
+                if (it.quality.contains("1080")) 1080
+                else if (it.quality.contains("720")) 720
+                else if (it.quality.contains("480")) 480
+                else 0
+            }
+
         } catch (e: Exception) {
             Log.e(TAG, "Error getting stream links for $postUrl", e)
         }
         streamItems
     }
 
-    private fun isTargetStreamHost(href: String): Boolean {
-        val lower = href.lowercase()
-        return lower.contains("adhlinks") ||
-                lower.contains("hubcloud") ||
-                lower.contains("gdflix") ||
-                lower.contains("pixeldrain") ||
-                lower.contains("cloudflarestorage") ||
-                lower.contains("fastdl") ||
-                lower.contains("filebee") ||
-                lower.endsWith(".m3u8") ||
-                lower.endsWith(".mp4")
+    private fun extractQualitiesFromHtml(html: String, targetEpisode: Int): List<RawQualityLink> {
+        val results = mutableListOf<RawQualityLink>()
+
+        // 1. Movie blocks with pro-ep-quality
+        val moviePattern = Pattern.compile(
+            "<span[^>]*pro-ep-quality[^>]*>.*?</div>\\s*<div[^>]*pro-btn-group[^>]*>.*?</div>",
+            Pattern.DOTALL
+        )
+        val mMatcher = moviePattern.matcher(html)
+        var foundMovie = false
+        while (mMatcher.find()) {
+            foundMovie = true
+            val block = mMatcher.group(0) ?: continue
+            val qPattern = Pattern.compile("pro-ep-quality[^>]*>\\[?(480[pP]|720[pP]|1080[pP]|2160[pP]|4[kK])[^<\\]]*\\]?")
+            val qM = qPattern.matcher(block)
+            val rawQ = if (qM.find()) qM.group(1)?.uppercase() ?: "HD" else "HD"
+            val quality = if (!rawQ.endsWith("P") && rawQ != "4K") "${rawQ}P" else rawQ
+
+            val sPattern = Pattern.compile("pro-ep-size[^>]*>💾?\\s*([^<]+)")
+            val sM = sPattern.matcher(block)
+            val size = if (sM.find()) sM.group(1)?.trim() ?: "HD" else "HD"
+
+            val linkPattern = Pattern.compile("href=[\"']([^\"']+)[\"']")
+            val lM = linkPattern.matcher(block)
+            while (lM.find()) {
+                val link = lM.group(1) ?: continue
+                if (isStreamingHost(link)) {
+                    results.add(RawQualityLink(quality, size, link))
+                    break // pick primary host per quality block
+                }
+            }
+        }
+        if (foundMovie && results.isNotEmpty()) {
+            return results
+        }
+
+        // 2. Series with H4 blocks (Each H4 represents an episode)
+        val h4Pattern = Pattern.compile("<h4[^>]*>(.*?)</h4>", Pattern.DOTALL)
+        val h4Matcher = h4Pattern.matcher(html)
+        val h4Blocks = mutableListOf<String>()
+        while (h4Matcher.find()) {
+            val content = h4Matcher.group(1) ?: continue
+            if (content.contains("480P", ignoreCase = true) ||
+                content.contains("720P", ignoreCase = true) ||
+                content.contains("1080P", ignoreCase = true)
+            ) {
+                h4Blocks.add(content)
+            }
+        }
+
+        if (h4Blocks.isNotEmpty()) {
+            val epIndex = (targetEpisode - 1).coerceIn(0, h4Blocks.size - 1)
+            val selectedBlock = h4Blocks[epIndex]
+
+            // Split into sections by quality (480P, 720P, 1080P, 4K)
+            val parts = selectedBlock.split(Regex("(?=\\b(?:480[pP]|720[pP]|1080[pP]|2160[pP]|4[kK])\\b)"))
+            for (part in parts) {
+                val qMatch = Regex("\\b(480[pP]|720[pP]|1080[pP]|2160[pP]|4[kK])\\b").find(part)
+                if (qMatch != null) {
+                    val rawQ = qMatch.value.uppercase()
+                    val quality = if (!rawQ.endsWith("P") && rawQ != "4K") "${rawQ}P" else rawQ
+                    val sizeMatch = Regex("\\[Size:\\s*([^\\]]+)\\]", RegexOption.IGNORE_CASE).find(part)
+                    val size = sizeMatch?.groupValues?.get(1)?.trim() ?: "HD"
+
+                    val linkPattern = Pattern.compile("href=[\"']([^\"']+)[\"']")
+                    val lMatcher = linkPattern.matcher(part)
+                    while (lMatcher.find()) {
+                        val link = lMatcher.group(1) ?: continue
+                        if (isStreamingHost(link)) {
+                            results.add(RawQualityLink(quality, size, link))
+                            break
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Fallback: Scan full html for any quality labeled links
+        if (results.isEmpty()) {
+            val genericQualities = listOf("1080P", "720P", "480P")
+            for (q in genericQualities) {
+                val pattern = Pattern.compile("$q.*?href=[\"']([^\"']*(?:hubcloud|pixeldrain|gdflix)[^\"']*)[\"']", Pattern.DOTALL or Pattern.CASE_INSENSITIVE)
+                val matcher = pattern.matcher(html)
+                if (matcher.find()) {
+                    val link = matcher.group(1) ?: continue
+                    results.add(RawQualityLink(q, "HD", link))
+                }
+            }
+        }
+
+        return results
     }
 
-    private fun isDirectStreamOrCloudHost(href: String): Boolean {
-        val lower = href.lowercase()
+    private fun isStreamingHost(url: String): Boolean {
+        val lower = url.lowercase()
         return lower.contains("hubcloud") ||
                 lower.contains("gdflix") ||
                 lower.contains("pixeldrain") ||
                 lower.contains("cloudflarestorage") ||
-                lower.contains("filebee") ||
+                lower.contains("desidubanime") ||
                 lower.endsWith(".m3u8") ||
-                lower.endsWith(".mp4") ||
-                lower.endsWith(".mkv")
+                lower.endsWith(".mp4")
     }
 
-    private fun resolveHubCloudStream(hubcloudUrl: String): List<StreamItem> {
-        val items = mutableListOf<StreamItem>()
+    private fun resolveHubCloudDirectStream(hubcloudUrl: String): List<String> {
+        val directUrls = mutableListOf<String>()
         try {
             val req = Request.Builder()
                 .url(hubcloudUrl)
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0")
                 .build()
             val res = client.newCall(req).execute()
-            if (!res.isSuccessful) return items
+            if (!res.isSuccessful) return directUrls
             val html = res.body?.string() ?: ""
 
-            // Look for gamerxyt direct link generator or direct links
+            // Look for gamerxyt direct link generator
             val tokenPattern = Pattern.compile("href=[\"'](https?://gamerxyt\\.com/hubcloud\\.php\\?[^\"']+)[\"']")
             val tokenMatcher = tokenPattern.matcher(html)
             if (tokenMatcher.find()) {
@@ -279,47 +383,31 @@ class AnimeDubHindiProvider(
                 val gRes = client.newCall(gReq).execute()
                 if (gRes.isSuccessful) {
                     val gHtml = gRes.body?.string() ?: ""
-                    // Extract Cloudflare R2 / PixelDrain / FSL Server direct stream URL
-                    val streamPattern = Pattern.compile("href=[\"'](https?://[^\"']*(?:cloudflarestorage\\.com|pixeldrain\\.dev|pixel\\.hubcloud)[^\"']*)[\"']")
+                    // Look for pixel.hubcloud or cloudflarestorage or pixeldrain direct link
+                    val streamPattern = Pattern.compile("href=[\"'](https?://[^\"']*(?:pixel\\.hubcloud|cloudflarestorage|pixeldrain)[^\"']*)[\"']")
                     val streamMatcher = streamPattern.matcher(gHtml)
                     while (streamMatcher.find()) {
                         val sUrl = streamMatcher.group(1) ?: continue
-                        val quality = if (sUrl.contains("1080")) "1080p (AnimeDubHindi)"
-                            else if (sUrl.contains("720")) "720p (AnimeDubHindi)"
-                            else if (sUrl.contains("480")) "480p (AnimeDubHindi)"
-                            else "1080p (AnimeDubHindi Direct)"
-                        items.add(
-                            StreamItem(
-                                quality = quality,
-                                url = sUrl,
-                                size = "HD",
-                                cookie = ""
-                            )
-                        )
+                        if (!directUrls.contains(sUrl)) {
+                            directUrls.add(sUrl)
+                        }
                     }
                 }
             }
 
-            // Also check for direct r2 or pixel links in hubcloud directly
-            val directPattern = Pattern.compile("href=[\"'](https?://[^\"']*(?:cloudflarestorage|pixel\\.hubcloud|pixeldrain)[^\"']*)[\"']")
+            // Direct pixel or cloudflare link in hubcloud
+            val directPattern = Pattern.compile("href=[\"'](https?://[^\"']*(?:pixel\\.hubcloud|cloudflarestorage|pixeldrain)[^\"']*)[\"']")
             val dMatcher = directPattern.matcher(html)
             while (dMatcher.find()) {
                 val dUrl = dMatcher.group(1) ?: continue
-                if (!items.any { it.url == dUrl }) {
-                    items.add(
-                        StreamItem(
-                            quality = "720p (AnimeDubHindi Direct)",
-                            url = dUrl,
-                            size = "HD",
-                            cookie = ""
-                        )
-                    )
+                if (!directUrls.contains(dUrl)) {
+                    directUrls.add(dUrl)
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Hubcloud stream resolution error: ${e.message}")
+            Log.w(TAG, "Hubcloud resolution error for $hubcloudUrl: ${e.message}")
         }
-        return items
+        return directUrls
     }
 
     suspend fun resolveStreamForTitle(
@@ -327,13 +415,13 @@ class AnimeDubHindiProvider(
         season: Int = 1,
         episode: Int = 1
     ): List<StreamItem> = withContext(Dispatchers.IO) {
-        val searchResults = search(title)
+        val searchResults = search(title, season)
         if (searchResults.isEmpty()) {
             Log.w(TAG, "No AnimeDubHindi results for '$title'")
             return@withContext emptyList()
         }
 
-        // Match the closest result (first or matching season)
+        // Match season
         val matched = searchResults.firstOrNull {
             it.title.contains("Season $season", ignoreCase = true) ||
             it.title.contains("S0$season", ignoreCase = true) ||

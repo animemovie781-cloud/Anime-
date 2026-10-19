@@ -15,8 +15,12 @@ class AnimeDubHindiAdapter:
             "https://www.animedubhindi.cc"
         ]
 
-    async def search(self, query: str) -> List[Dict[str, Any]]:
-        queries = [query]
+    async def search(self, query: str, season: int = 1) -> List[Dict[str, Any]]:
+        queries = []
+        if season > 1:
+            queries.append(f"{query} Season {season}")
+            queries.append(f"{query} S{season}")
+        queries.append(query)
         if ":" in query:
             queries.append(query.split(":")[0].strip())
         words = query.split()
@@ -32,7 +36,7 @@ class AnimeDubHindiAdapter:
             "Referer": "https://www.google.com/"
         }
 
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
             for base_url in self.domains:
                 for q in queries:
                     search_url = f"{base_url}/?s={q}"
@@ -76,66 +80,76 @@ class AnimeDubHindiAdapter:
                 resp = await client.get(post_url, headers=headers)
                 if resp.status_code != 200:
                     return []
-                soup = BeautifulSoup(resp.text, "html.parser")
+                html = resp.text
 
-                iframe_a = soup.select_one("div.wp-block-button a")
-                if not iframe_a:
-                    iframe_a = soup.select_one("iframe") or soup.select_one(".entry-content a")
-
-                iframe_url = iframe_a.get("href") or iframe_a.get("src") if iframe_a else None
+                # Check for intermediate adhlinks.com
+                adh_match = re.search(r"href=[\"'](https?://[^\"']*adhlinks\.com/[^\"']+)[\"']", html)
+                target_html = html
+                if adh_match:
+                    try:
+                        a_resp = await client.get(adh_match.group(1), headers=headers)
+                        if a_resp.status_code == 200:
+                            target_html = a_resp.text
+                    except Exception:
+                        pass
 
                 sources = []
-                if iframe_url and iframe_url.startswith("http"):
-                    try:
-                        i_resp = await client.get(iframe_url, headers=headers)
-                        if i_resp.status_code == 200:
-                            i_soup = BeautifulSoup(i_resp.text, "html.parser")
-                            for a in i_soup.select("a"):
-                                href = a.get("href", "")
-                                if any(k in href for k in ["hubcloud", "gdflix", "pixeldrain", "r2.cloudflarestorage", "adhlinks"]):
+
+                # 1. Movie blocks
+                movie_blocks = re.findall(r"(<span[^>]*pro-ep-quality[^>]*>.*?</div>\s*<div[^>]*pro-btn-group[^>]*>.*?</div>)", target_html, re.DOTALL)
+                if movie_blocks:
+                    for b in movie_blocks:
+                        q_match = re.search(r"pro-ep-quality[^>]*>\[?(480[pP]|720[pP]|1080[pP]|2160[pP]|4[kK])[^<\]]*\]?", b)
+                        raw_q = q_match.group(1).upper() if q_match else "HD"
+                        quality = (raw_q + "P") if not raw_q.endswith("P") and raw_q != "4K" else raw_q
+                        links = re.findall(r"href=[\"']([^\"']+)[\"']", b)
+                        for link in links:
+                            if any(k in link for k in ["hubcloud", "gdflix", "pixeldrain", "r2", "desidubanime"]):
+                                sources.append({
+                                    "provider": "AnimeDubHindi",
+                                    "url": link,
+                                    "quality": f"{quality} (AnimeDubHindi)",
+                                    "language": "Hindi Dub",
+                                    "source_type": "official_watch_url"
+                                })
+
+                # 2. Series H4 blocks
+                if not sources:
+                    h4_tags = re.findall(r"<h4[^>]*>(.*?)</h4>", target_html, re.DOTALL)
+                    filtered_h4 = [h for h in h4_tags if any(q in h for q in ["480P", "720P", "1080P", "480p", "720p", "1080p"])]
+                    if filtered_h4:
+                        ep_idx = max(0, min(episode - 1, len(filtered_h4) - 1))
+                        selected_h4 = filtered_h4[ep_idx]
+                        parts = re.split(r"(\b(?:480[pP]|720[pP]|1080[pP]|2160[pP]|4[kK])\b)", selected_h4)
+                        for i in range(1, len(parts), 2):
+                            raw_q = parts[i].upper()
+                            quality = (raw_q + "P") if not raw_q.endswith("P") and raw_q != "4K" else raw_q
+                            chunk = parts[i + 1] if i + 1 < len(parts) else ""
+                            links = re.findall(r"href=[\"']([^\"']+)[\"']", chunk)
+                            for link in links:
+                                if any(k in link for k in ["hubcloud", "gdflix", "pixeldrain", "r2", "desidubanime"]):
                                     sources.append({
                                         "provider": "AnimeDubHindi",
-                                        "url": href,
-                                        "quality": "1080p",
-                                        "language": "Hindi",
+                                        "url": link,
+                                        "quality": f"{quality} (AnimeDubHindi)",
+                                        "language": "Hindi Dub",
                                         "source_type": "official_watch_url"
                                     })
-                    except Exception:
-                        pass
 
-                for a in soup.select("a"):
-                    href = a.get("href", "")
-                    if any(k in href for k in ["hubcloud", "gdflix", "pixeldrain", "r2.cloudflarestorage", "adhlinks"]):
-                        if not any(s["url"] == href for s in sources):
-                            sources.append({
-                                "provider": "AnimeDubHindi",
-                                "url": href,
-                                "quality": "1080p",
-                                "language": "Hindi",
-                                "source_type": "official_watch_url"
-                            })
+                # 3. Direct links fallback
+                if not sources:
+                    for a in re.findall(r"href=[\"']([^\"']*(?:hubcloud|gdflix|pixeldrain|r2\.cloudflarestorage)[^\"']*)[\"']", target_html):
+                        q = "1080p (AnimeDubHindi)" if "1080" in a else "720p (AnimeDubHindi)" if "720" in a else "480p (AnimeDubHindi)"
+                        sources.append({
+                            "provider": "AnimeDubHindi",
+                            "url": a,
+                            "quality": q,
+                            "language": "Hindi Dub",
+                            "source_type": "official_watch_url"
+                        })
 
-                # Check for direct intermediate links from adhlinks if found
-                adh_links = [s["url"] for s in sources if "adhlinks" in s["url"]]
-                for alink in adh_links[:2]:
-                    try:
-                        a_resp = await client.get(alink, headers=headers)
-                        if a_resp.status_code == 200:
-                            a_soup = BeautifulSoup(a_resp.text, "html.parser")
-                            for a in a_soup.select("a"):
-                                ahref = a.get("href", "")
-                                if any(k in ahref for k in ["hubcloud", "gdflix", "pixeldrain", "r2.cloudflarestorage"]):
-                                    if not any(s["url"] == ahref for s in sources):
-                                        sources.append({
-                                            "provider": "AnimeDubHindi",
-                                            "url": ahref,
-                                            "quality": "1080p",
-                                            "language": "Hindi",
-                                            "source_type": "official_watch_url"
-                                        })
-                    except Exception:
-                        pass
-
+                # Sort by quality (1080p -> 720p -> 480p)
+                sources.sort(key=lambda s: 1080 if "1080" in s["quality"] else 720 if "720" in s["quality"] else 480 if "480" in s["quality"] else 0, reverse=True)
                 return sources
             except Exception as e:
                 traceback.print_exc()
