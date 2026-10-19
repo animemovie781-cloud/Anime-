@@ -34,7 +34,8 @@ class MovieViewModel(application: Application) : AndroidViewModel(application) {
     private val database = MovieDatabase.getDatabase(application)
     private val repository = MovieRepository(
         MovieBoxRetrofitClient.getApi(prefs),
-        database.movieDao()
+        database.movieDao(),
+        prefs
     )
 
     // Developer and Sandbox / Lockout State
@@ -54,10 +55,24 @@ class MovieViewModel(application: Application) : AndroidViewModel(application) {
     var customCountryIso by mutableStateOf(prefs.localIso.ifEmpty { "in" })
     var mockHost by mutableStateOf(prefs.mockHost)
     var apiHost by mutableStateOf(prefs.apiHost)
+    var metadataSource by mutableStateOf(prefs.metadataSource)
+    var tmdbApiKey by mutableStateOf(prefs.tmdbApiKey)
 
     fun updateApiHost(newHost: String) {
         prefs.apiHost = newHost
         apiHost = newHost
+        loadDashboardContent()
+    }
+
+    fun updateMetadataSource(newSource: String) {
+        prefs.metadataSource = newSource
+        metadataSource = newSource
+        loadDashboardContent()
+    }
+
+    fun updateTmdbApiKey(newKey: String) {
+        prefs.tmdbApiKey = newKey
+        tmdbApiKey = newKey
         loadDashboardContent()
     }
 

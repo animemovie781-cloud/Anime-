@@ -15,8 +15,18 @@ class PreferencesManager(context: Context) {
         const val KEY_MOCK_HOST = "mock_host_key"
         const val KEY_API_HOST = "api_host_key"
         const val KEY_SESSION_ID_COOKIE = "session_id_cookie"
+        const val KEY_TMDB_API_KEY = "tmdb_api_key"
+        const val KEY_METADATA_SOURCE = "metadata_source"
     }
     
+    var tmdbApiKey: String
+        get() = prefs.getString(KEY_TMDB_API_KEY, com.example.data.network.TmdbClient.DEFAULT_TMDB_API_KEY) ?: com.example.data.network.TmdbClient.DEFAULT_TMDB_API_KEY
+        set(value) = prefs.edit().putString(KEY_TMDB_API_KEY, value).apply()
+
+    var metadataSource: String
+        get() = prefs.getString(KEY_METADATA_SOURCE, "tmdb") ?: "tmdb" // "tmdb" or "moviebox"
+        set(value) = prefs.edit().putString(KEY_METADATA_SOURCE, value).apply()
+
     var apiHost: String
         get() = prefs.getString(KEY_API_HOST, "api6.aoneroom.com") ?: "api6.aoneroom.com"
         set(value) = prefs.edit().putString(KEY_API_HOST, value).apply()

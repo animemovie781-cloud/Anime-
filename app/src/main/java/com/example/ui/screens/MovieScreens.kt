@@ -4534,6 +4534,225 @@ fun SettingsScreen(viewModel: MovieViewModel, onNavigateToHistory: () -> Unit = 
 
                 Spacer(modifier = Modifier.height(12.dp))
 
+                var showMetadataSourceDialog by remember { mutableStateOf(false) }
+                var showTmdbApiKeyDialog by remember { mutableStateOf(false) }
+                var tmdbKeyInput by remember(viewModel.tmdbApiKey) { mutableStateOf(viewModel.tmdbApiKey) }
+
+                // Metadata Provider Selection Section
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp),
+                    colors = CardDefaults.cardColors(containerColor = ObsidianCard),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showMetadataSourceDialog = true }
+                            .padding(horizontal = 16.dp, vertical = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Filled.Movie,
+                                contentDescription = "Metadata Provider",
+                                tint = CinematicRed,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column {
+                                Text(
+                                    text = "Metadata Provider",
+                                    fontSize = 16.sp,
+                                    color = TextPrimary,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = if (viewModel.metadataSource == "tmdb") "TMDB API (Fast & Reliable)" else "MovieBox Official API",
+                                    fontSize = 12.sp,
+                                    color = TextSecondary
+                                )
+                            }
+                        }
+                        Icon(
+                            imageVector = Icons.Filled.ChevronRight,
+                            contentDescription = "Navigate",
+                            tint = TextSecondary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
+
+                if (showMetadataSourceDialog) {
+                    AlertDialog(
+                        onDismissRequest = { showMetadataSourceDialog = false },
+                        title = { Text("Metadata Provider", color = TextPrimary, fontWeight = FontWeight.Bold) },
+                        text = {
+                            Column {
+                                val sources = listOf(
+                                    "tmdb" to "TMDB API (Recommended)\nFast, high-res posters, no 401 JWT errors. Stream links resolved from app.",
+                                    "moviebox" to "MovieBox Official API\nDirect catalog from official backend."
+                                )
+                                sources.forEach { (sourceKey, desc) ->
+                                    val isSelected = viewModel.metadataSource == sourceKey
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable {
+                                                viewModel.updateMetadataSource(sourceKey)
+                                                showMetadataSourceDialog = false
+                                            }
+                                            .padding(vertical = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        RadioButton(
+                                            selected = isSelected,
+                                            onClick = {
+                                                viewModel.updateMetadataSource(sourceKey)
+                                                showMetadataSourceDialog = false
+                                            },
+                                            colors = RadioButtonDefaults.colors(selectedColor = CinematicRed, unselectedColor = Color.Gray)
+                                        )
+                                        Spacer(modifier = Modifier.width(10.dp))
+                                        Column {
+                                            Text(
+                                                text = if (sourceKey == "tmdb") "TMDB API (Recommended)" else "MovieBox Official API",
+                                                color = TextPrimary,
+                                                fontSize = 15.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            Text(
+                                                text = if (sourceKey == "tmdb") "No 401 JWT error, fast posters & seasons. Streams resolved via app." else "Direct official catalog.",
+                                                color = TextSecondary,
+                                                fontSize = 12.sp
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        confirmButton = {
+                            TextButton(onClick = { showMetadataSourceDialog = false }) {
+                                Text("Close", color = TextSecondary, fontWeight = FontWeight.Bold)
+                            }
+                        },
+                        containerColor = ObsidianCard
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // TMDB API Key Section
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp),
+                    colors = CardDefaults.cardColors(containerColor = ObsidianCard),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                tmdbKeyInput = viewModel.tmdbApiKey
+                                showTmdbApiKeyDialog = true
+                            }
+                            .padding(horizontal = 16.dp, vertical = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Filled.VpnKey,
+                                contentDescription = "TMDB API Key",
+                                tint = TextPrimary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column {
+                                Text(
+                                    text = "TMDB API Key",
+                                    fontSize = 16.sp,
+                                    color = TextPrimary,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = if (viewModel.tmdbApiKey.length > 8) "${viewModel.tmdbApiKey.take(4)}...${viewModel.tmdbApiKey.takeLast(4)}" else "Active Default Key",
+                                    fontSize = 12.sp,
+                                    color = TextSecondary
+                                )
+                            }
+                        }
+                        Icon(
+                            imageVector = Icons.Filled.ChevronRight,
+                            contentDescription = "Navigate",
+                            tint = TextSecondary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
+
+                if (showTmdbApiKeyDialog) {
+                    AlertDialog(
+                        onDismissRequest = { showTmdbApiKeyDialog = false },
+                        title = { Text("TMDB API Key", color = TextPrimary, fontWeight = FontWeight.Bold) },
+                        text = {
+                            Column {
+                                Text(
+                                    text = "Enter your custom The Movie Database (TMDB) API Key to fetch movies, posters, cast, and episode info without limits.",
+                                    color = TextSecondary,
+                                    fontSize = 13.sp,
+                                    lineHeight = 18.sp
+                                )
+                                Spacer(modifier = Modifier.height(12.dp))
+                                OutlinedTextField(
+                                    value = tmdbKeyInput,
+                                    onValueChange = { tmdbKeyInput = it.trim() },
+                                    label = { Text("API Key", color = TextSecondary) },
+                                    singleLine = true,
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedTextColor = TextPrimary,
+                                        unfocusedTextColor = TextPrimary,
+                                        focusedBorderColor = CinematicRed,
+                                        unfocusedBorderColor = Color.DarkGray
+                                    ),
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                TextButton(
+                                    onClick = {
+                                        tmdbKeyInput = com.example.data.network.TmdbClient.DEFAULT_TMDB_API_KEY
+                                    }
+                                ) {
+                                    Text("Reset to Default Key", color = CinematicRed, fontSize = 12.sp)
+                                }
+                            }
+                        },
+                        confirmButton = {
+                            TextButton(
+                                onClick = {
+                                    if (tmdbKeyInput.isNotBlank()) {
+                                        viewModel.updateTmdbApiKey(tmdbKeyInput)
+                                    }
+                                    showTmdbApiKeyDialog = false
+                                }
+                            ) {
+                                Text("Save", color = CinematicRed, fontWeight = FontWeight.Bold)
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showTmdbApiKeyDialog = false }) {
+                                Text("Cancel", color = TextSecondary)
+                            }
+                        },
+                        containerColor = ObsidianCard
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
                 // Select API Host Section
                 Card(
                     modifier = Modifier

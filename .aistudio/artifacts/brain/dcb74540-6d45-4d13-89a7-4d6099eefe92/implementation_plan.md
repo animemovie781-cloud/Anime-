@@ -1,83 +1,111 @@
-# Python Backend PRD & Implementation Plan
+# TMDB Metadata with Dedicated File-Based Stream Extraction Architecture
 
-This document outlines the requirements and architectural plan for a Python-based backend service. The primary goal is to provide a reliable, high-performance API for the Android movie application by proxying and cleaning data from official streaming backends.
+This plan specifies the architecture to strictly isolate concerns as requested: **all metadata (browse, search, details, posters) is loaded directly from TMDB**, and **only the stream link resolution logic from the provided server/extractor file (`api_server_download.txt`) is used to load streams into the video player**.
+
+---
 
 ### User Review & Critical Decisions
 
 > [!IMPORTANT]
-> The following decisions were confirmed based on your requirements:
-> - **Core Objective**: Proxy/Scraper for official APIs (not a standalone CMS).
-> - **Tech Stack**: Python with FastAPI (Recommended for its native async support and performance).
-> - **Deployment**: Render (using the Web Service tier).
+> The following decisions are locked based on your explicit requirement:
+> - **Metadata Isolation**: 100% TMDB API key driven. All discovery, trending, search, genres, posters, episode listings, and cast are loaded cleanly from TMDB so there are zero 401 JWT unauthorized errors on the browsing screens.
+> - **Stream-Only Logic from Provided File**: The stream resolving algorithm from `api_server_download.txt` is used **exclusively when playing content**. When the user clicks play on any movie, TV show, or anime, only the `/stream/` pipeline executes.
+> - **Video Player Delivery**: ExoPlayer receives the resolved direct stream URL (HLS / MP4 / DASH) with its authenticated `signCookie` and displays quality selector options (1080p, 720p, 480p, Auto).
 
-- **Decision 1**: **FastAPI vs Flask**. I have selected **FastAPI** as the primary recommendation because it handles asynchronous network requests (I/O) much more efficiently than Flask, which is critical when proxying multiple external API calls.
-- **Decision 2**: **Signature Logic**. The backend will centralize the `x-tr-signature` cryptographic logic, removing the need for the Android app to handle complex header generation.
+- **Confirmed Decision 1**: **Zero Metadata Traffic to the Flaky Upstream Gateway**. The app will never make trending, tab, or search calls to the upstream MovieBox BFF gateway (which triggers the 401 JWT expired error). TMDB handles all UI content.
+- **Confirmed Decision 2**: **Faithful Stream Pipeline from `api_server_download.txt`**:
+  1. Title mapping (resolving TMDB title to internal stream subject ID).
+  2. Primary `/wefeed-mobile-bff/subject-api/play-info` call.
+  3. Anti-piracy `urlprefix` Base64 decode from `signCookie`.
+  4. `resourceDetectors` fallback if `play-info` has no direct streams.
+  5. H.264 (MP4 / HLS) codec prioritization over HEVC for mobile playback reliability.
+  6. UGC resource mirror rotation if primary cloud is offline.
 
 ---
 
 ### 1. Overview & Core Concept
 
-- **What It Does**: A "Middleware" service that sits between the Android app and official movie servers. It intercepts requests, attaches required security headers, fetches data, cleans/flattens the JSON, extracts real streaming links (bypassing traps), and returns a simplified response to the mobile client.
-- **Target Audience**: Developers and users of the Genga World / MovieBox Android client.
-- **Key Value**: 
-    - **Stability**: If official API endpoints change, only the backend needs an update, not the app.
-    - **Performance**: Heavy data transformation and extraction happen on the server, not the user's phone.
-    - **Security**: Official API keys and signature algorithms are hidden behind the server.
+- **What It Does**: Decouples the application into a high-speed, beautiful frontend powered by TMDB metadata, and a dedicated stream extraction pipeline extracted directly from the user's `api_server_download.txt`. When a movie or anime episode is tapped, the stream pipeline resolves the playable link and hands it directly to ExoPlayer.
+- **Target Audience**: Users who want guaranteed smooth navigation with rich movie and anime metadata, without broken dashboards or 401 gateway errors, while playing actual video streams.
+- **Key Value**: 100% reliability for browsing/searching + automated stream link extraction from the provided backend logic.
 
 ---
 
-### 2. Technical Architecture & Data Strategy
+### 2. User Experience & Visual Design
 
-The system follows a stateless proxy architecture optimized for speed and reliability.
-
-#### System Architecture Diagram
-
-```box
-┌─────────────────────────┐      ┌─────────────────────────────┐
-│      Android App        │      │       Python Backend        │
-│   (Kotlin / Compose)    │◄────▶│      (FastAPI @ Render)     │
-└─────────────────────────┘      └──────────────┬──────────────┘
-                                                │
-                                                ▼
-                                 ┌─────────────────────────────┐
-                                 │      Official Movie API     │
-                                 │  (api6.aoneroom.com, etc.)  │
-                                 └─────────────────────────────┘
-```
-
-#### Core Endpoints
-
-| Endpoint | Method | Description |
-|:---|:---|:---|
-| `/trending` | GET | Returns a flat list of trending movies and shows. |
-| `/search` | GET | Query parameters for universal search across all categories. |
-| `/detail/{id}` | GET | Returns full metadata, cast, and structured episode/season lists. |
-| `/stream/{id}` | GET | Resolves real playback URLs, bypassing dummy traps and providing quality options. |
-| `/health` | GET | Health check for Render deployment monitoring. |
+#### Key User Flows
+1. **Browsing & Search**: Instant loading of Trending, Top Rated, and Genre-filtered Movies, Series, and Anime directly via TMDB. Fast, error-free UI with high-resolution backdrops and posters.
+2. **Details Screen**: Comprehensive overview, ratings, cast cards, and full season/episode listings generated from TMDB.
+3. **Play Action**:
+   - User taps "Play Movie" or selects an Episode.
+   - The app's Stream Resolver executes the `api_server_download.txt` stream pipeline in the background.
+   - A subtle buffering indicator shows stream initialization.
+4. **Playback & Quality Selection**:
+   - Video player starts immediately with the prioritized H.264 stream.
+   - User can open the "Video Quality" sheet from the gear menu to toggle between 1080p, 720p, 480p, and Auto.
 
 ---
 
 ### 3. Key Product Decisions & Trade-Offs
 
-- **Decision 1: Server-Side Signature Generation**
-    - *Chosen Approach*: Backend generates the `x-tr-signature` for every request.
-    - *Why*: The signature algorithm involves a specific timestamp and MD5/HMAC sequence. Centralizing this prevents "Signature Mismatch" errors across different app versions.
-    - *Alternatives Considered*: Client-side generation (currently in app), but this is harder to maintain.
+- **Decision 1: TMDB for All Metadata vs. Upstream Gateway**
+  - *Chosen Approach*: Use TMDB for all search, home, and details views.
+  - *Why*: The upstream MovieBox gateway frequently expires anonymous tokens (401 Unauthorized), which previously crashed the home feed. TMDB has 100% uptime with no JWT expiration issues.
+  - *Alternative Considered*: Attempting to proxy all trending calls through Render; rejected because the user reported Render returns `401 Unauthorized: JWT token has expired`.
 
-- **Decision 2: Response Flattening**
-    - *Chosen Approach*: The backend will map complex nested structures (e.g., `data.list[0].items[0].subject`) into a simple list of objects.
-    - *Why*: Reduces mobile data usage and makes the Android `LazyColumn` implementations significantly simpler and faster.
-
-- **Decision 3: Render Deployment Strategy**
-    - *Chosen Approach*: Use a `Dockerfile` for deployment on Render.
-    - *Why*: Ensures a consistent environment (Python version, dependencies like `cryptography` and `httpx`) between local development and production.
+- **Decision 2: Direct Implementation of `api_server_download.txt` Stream Resolver**
+  - *Chosen Approach*: Port the exact Python stream resolution algorithms from `api_server_download.txt` into the client's `LocalMovieBoxServer` and `MovieRepository` stream handler.
+  - *Why*: Ensures the Android client can resolve streams locally on-device without depending on an external Render proxy that fails authentication.
 
 ---
 
-### 4. Implementation Steps
+### 4. Technical Architecture & Data Strategy
 
-1.  **Project Bootstrap**: Setup FastAPI with `httpx` for async HTTP requests and `pydantic` for data validation.
-2.  **Signature Module**: Port the Java/Kotlin signature logic (`MD5`, `HMAC-MD5`, `Base64`) to a Python utility module.
-3.  **Proxy Routes**: Implement the proxy handlers that forward requests with the correctly formatted `X-Client-Info` and `x-tr-signature` headers.
-4.  **Extraction Logic**: Implement the "Dummy Video Bypass" (urlprefix decoding) and UGC recovery logic.
-5.  **Deployment**: Create the `render.yaml` or `Dockerfile` for one-click deployment to Render.
+#### Architectural System Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Jetpack Compose UI                       │
+│     HomeFeed / Search / DetailScreen / PlayerScreen + Quality   │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │
+               ┌────────────────┴────────────────┐
+               ▼                                 ▼
+   [ METADATA OPERATIONS ]              [ STREAM PLAYBACK ONLY ]
+   (Browse / Search / Info)             (When User Clicks Play)
+               │                                 │
+               ▼                                 ▼
+┌──────────────────────────────┐ ┌────────────────────────────────┐
+│           TmdbApi            │ │  api_server_download Pipeline  │
+│  - Trending / Top Movies     │ │  (LocalMovieBoxServer.kt)      │
+│  - Multi-Search (Anime/Film) │ ├────────────────────────────────┤
+│  - Season & Episode Info     │ │ 1. Title -> Stream Subject ID  │
+│  - High-res Posters & Cast   │ │ 2. play-info API               │
+└──────────────────────────────┘ │ 3. urlprefix Base64 decode     │
+                                 │ 4. resourceDetectors fallback  │
+                                 │ 5. H.264 codec prioritization  │
+                                 │ 6. UGC mirror rotation         │
+                                 └───────────────┬────────────────┘
+                                                 │
+                                                 ▼
+                                 ┌────────────────────────────────┐
+                                 │         Media3 ExoPlayer       │
+                                 │  - HLS / MP4 playback          │
+                                 │  - signCookie injection        │
+                                 │  - Quality Sheet Selection     │
+                                 └────────────────────────────────┘
+```
+
+#### Detailed Stream Extraction Pipeline (from `api_server_download.txt`)
+1. **Title Resolution**: When `subjectId` starts with `tmdb_`, query stream database by title to obtain the stream `subjectId`.
+2. **Play Info Request**: Send authenticated request with dynamic token and timestamp signature for `(subjectId, season, episode, quality)`.
+3. **Anti-Piracy Bypass**: Inspect `signCookie` for `urlprefix=`. If present, Base64 decode the prefix and append stream target (`index.mpd` / `.m3u8` / `.mp4`).
+4. **Resource Detector Fallback**: If `streamList` is empty, query `resourceDetectors` in detail and parse `resolutionList` for matching season/episode.
+5. **Codec Prioritization**: Sort candidate streams so that non-HEVC H.264 MP4 and HLS streams are prioritized over H.265 (HEVC), which fails on most mobile browsers/players.
+6. **Delivery to ExoPlayer**: Populate `PlayInfo(streamList, subTitleList)` so ExoPlayer receives the direct stream with appropriate cookies and quality tags.
+
+#### Implementation Steps
+1. **Verify Metadata Complete Isolation**: Ensure all UI browsing and search views exclusively query `TmdbApi` with the configured API key.
+2. **Update Stream Handler in `LocalMovieBoxServer.kt`**: Integrate the exact `api_server_download.txt` stream pipeline (urlprefix decode, resourceDetectors fallback, H264 prioritization) into the `/stream/` endpoint.
+3. **Verify ExoPlayer Quality Selector**: Ensure the stream items returned by the pipeline populate the quality selection sheet in `MovieScreens.kt`.
+4. **Compile & Test Verification**: Verify build and run local unit tests.

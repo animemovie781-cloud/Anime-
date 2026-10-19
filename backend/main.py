@@ -8,8 +8,20 @@ from urllib.parse import quote
 
 from utils.crypto import generate_signature, get_client_info_json
 from utils.extractor import clean_stream_list
+from adapters.animedubhindi import AnimeDubHindiAdapter
 
-app = FastAPI(title="Movie Proxy API")
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Fetch a fresh token
+    print("Backend starting up, bootstrapping token...")
+    await bootstrap_token()
+    yield
+    # Shutdown: Clean up if needed
+    print("Backend shutting down...")
+
+app = FastAPI(title="Movie Proxy API", lifespan=lifespan)
 
 OFFICIAL_BASE_URL = "https://api.inmoviebox.com"
 DEFAULT_HOST = "api6.aoneroom.com"
@@ -23,6 +35,7 @@ class AppSession:
         self.last_refreshed = 0
 
 session = AppSession()
+animedub_adapter = AnimeDubHindiAdapter()
 
 async def bootstrap_token():
     """Mirror of Android's bootstrapGuestToken() with strict header compliance."""
@@ -163,6 +176,34 @@ async def get_detail(subject_id: str):
     data = await make_official_request("GET", "/wefeed-mobile-bff/subject-api/get", params={"subjectId": subject_id})
     return data
 
+@app.get("/providers")
+async def list_providers():
+    return {
+        "providers": [
+            {
+                "name": "MovieBoxProvider",
+                "active": True,
+                "languages": ["Hindi", "English", "Original"],
+                "supported_types": ["movie", "tv"]
+            },
+            {
+                "name": "Animedubhindi",
+                "active": True,
+                "languages": ["Hindi"],
+                "supported_types": ["anime", "tv", "movie"]
+            }
+        ]
+    }
+
+@app.get("/sources/anime/{title}")
+async def get_anime_sources(title: str, season: int = 1, episode: int = 1):
+    results = await animedub_adapter.search(title)
+    if not results:
+        return {"code": 0, "title": title, "sources": []}
+    matched = results[0]
+    links = await animedub_adapter.get_links(matched["url"], season=season, episode=episode)
+    return {"code": 0, "title": matched["title"], "url": matched["url"], "sources": links}
+
 @app.get("/stream/{subject_id}")
 async def get_stream(
     subject_id: str, 
@@ -175,10 +216,38 @@ async def get_stream(
     if resource_id:
         params["resourceId"] = resource_id
         
-    data = await make_official_request("GET", "/wefeed-mobile-bff/subject-api/play-info", params=params)
-    raw_streams = data.get("data", {}).get("streamList", []) or data.get("data", {}).get("streams", []) or []
-    global_cookie = data.get("signCookie", "")
-    cleaned = clean_stream_list(raw_streams, global_cookie)
+    cleaned = []
+    global_cookie = ""
+    try:
+        data = await make_official_request("GET", "/wefeed-mobile-bff/subject-api/play-info", params=params)
+        raw_streams = data.get("data", {}).get("streamList", []) or data.get("data", {}).get("streams", []) or []
+        global_cookie = data.get("signCookie", "")
+        cleaned = clean_stream_list(raw_streams, global_cookie)
+    except Exception as e:
+        print(f"Official stream fetch error: {e}")
+
+    # Fallback to AnimeDubHindi if empty or anime requested
+    if not cleaned:
+        try:
+            # Query title from detail if available
+            detail = await get_detail(subject_id)
+            title = detail.get("data", {}).get("title") or detail.get("data", {}).get("name") or subject_id
+            adh_results = await animedub_adapter.search(title)
+            if adh_results:
+                matched_adh = adh_results[0]
+                adh_links = await animedub_adapter.get_links(matched_adh["url"], season=season, episode=episode)
+                for l in adh_links:
+                    cleaned.append({
+                        "quality": l.get("quality", "1080p"),
+                        "url": l.get("url", ""),
+                        "cookie": "",
+                        "size": "Dynamic",
+                        "provider": "Animedubhindi",
+                        "language": "Hindi"
+                    })
+        except Exception as e:
+            print(f"AnimeDubHindi fallback error: {e}")
+
     first = cleaned[0] if cleaned else {}
     
     return {
@@ -193,3 +262,4 @@ async def get_stream(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

@@ -779,7 +779,44 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
                 }
                 
                 path.startsWith("/stream/") -> {
-                    val subjectId = path.substringAfter("/stream/").substringBefore("?").substringBefore("/")
+                    val rawSubjectId = path.substringAfter("/stream/").substringBefore("?").substringBefore("/")
+                    var subjectId = rawSubjectId
+                    if (rawSubjectId.startsWith("tmdb_")) {
+                        try {
+                            val prefs = context.getSharedPreferences("moviebox_prefs", Context.MODE_PRIVATE)
+                            val isTv = rawSubjectId.startsWith("tmdb_tv_")
+                            val cleanId = if (isTv) rawSubjectId.removePrefix("tmdb_tv_") else rawSubjectId.removePrefix("tmdb_movie_")
+                            val tmdbKey = prefs.getString("tmdb_api_key", com.example.data.network.TmdbClient.DEFAULT_TMDB_API_KEY) ?: com.example.data.network.TmdbClient.DEFAULT_TMDB_API_KEY
+                            val tmdbUrl = if (isTv) "https://api.themoviedb.org/3/tv/$cleanId?api_key=$tmdbKey" else "https://api.themoviedb.org/3/movie/$cleanId?api_key=$tmdbKey"
+                            val req = Request.Builder().url(tmdbUrl).build()
+                            val res = okHttpClient.newCall(req).execute()
+                            if (res.isSuccessful) {
+                                val body = res.body?.string() ?: ""
+                                val parsed = parseJsonToMap(body)
+                                val title = (parsed["title"] ?: parsed["name"])?.toString() ?: ""
+                                if (title.isNotEmpty()) {
+                                    val searchPayload = mapOf("keyword" to title, "page" to 1, "pageSize" to 10)
+                                    val searchRaw = makeOfficialRequest("POST", "/wefeed-mobile-bff/subject-api/search", emptyMap(), toJsonString(searchPayload))
+                                    val searchMap = parseJsonToMap(searchRaw)
+                                    val searchData = searchMap["data"] as? Map<String, Any?>
+                                    val searchItems = (searchData?.get("items") ?: searchData?.get("list")) as? List<Map<String, Any?>> ?: emptyList()
+                                    if (searchItems.isNotEmpty()) {
+                                        val match = searchItems.firstOrNull { item ->
+                                            val subType = item["subjectType"] ?: item["type"] ?: 1
+                                            val itemIsMovie = subType.toString().toDoubleOrNull()?.toInt() == 1
+                                            itemIsMovie == !isTv
+                                        } ?: searchItems.firstOrNull()
+                                        if (match != null) {
+                                            subjectId = match["id"]?.toString() ?: rawSubjectId
+                                            Log.i("LocalMovieBoxServer", "Resolved TMDB title '$title' to MovieBox ID: $subjectId")
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.e("LocalMovieBoxServer", "Error resolving TMDB subjectId for streaming: $rawSubjectId", e)
+                        }
+                    }
                     val season = qParams["season"] ?: "1"
                     val episode = qParams["episode"] ?: "1"
                     val quality = qParams["quality"] ?: "720p"
@@ -788,10 +825,11 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
                     try {
                         var isMovie = false
                         var subResourceId = subjectId
+                        var detailData: Map<String, Any?>? = null
                         try {
                             val detailResponseRaw = makeOfficialRequest("GET", "/wefeed-mobile-bff/subject-api/get", mapOf("subjectId" to subjectId))
                             val detailResponse = parseJsonToMap(detailResponseRaw)
-                            val detailData = detailResponse["data"] as? Map<String, Any?>
+                            detailData = detailResponse["data"] as? Map<String, Any?>
                             val type = detailData?.get("subjectType") ?: detailData?.get("type") ?: 1
                             isMovie = type.toString().toDoubleOrNull()?.toInt() == 1
                             
@@ -828,8 +866,48 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
                         val responseMap = parseJsonToMap(rawResponse)
                         val data = responseMap["data"] as? Map<String, Any?> ?: emptyMap<String, Any?>()
 
-                        var streams = data["streamList"] as? List<Map<String, Any?>> ?: data["streams"] as? List<Map<String, Any?>> ?: emptyList()
+                        var streams = (data["streamList"] as? List<Map<String, Any?>> ?: data["streams"] as? List<Map<String, Any?>> ?: emptyList()).map { it.toMutableMap() }.toMutableList()
                         val globalCookie = responseMap["signCookie"] ?: data["signCookie"] ?: ""
+
+                        // Fallback to resourceDetectors inside movie/show detail if no streams found in play-info (from api_server_download.txt)
+                        if (streams.isEmpty()) {
+                            try {
+                                val detectors = (detailData?.get("resourceDetectors") as? List<Map<String, Any?>>) ?: emptyList()
+                                for (det in detectors) {
+                                    if (finalResourceId != null && det["resourceId"]?.toString() != finalResourceId) continue
+                                    val resList = det["resolutionList"] as? List<Map<String, Any?>> ?: emptyList()
+                                    for (resItem in resList) {
+                                        if (!isMovie) {
+                                            val itemSe = resItem["se"] ?: resItem["season"]
+                                            val itemEp = resItem["ep"] ?: resItem["episode"]
+                                            if (itemSe != null && itemEp != null) {
+                                                if (itemSe.toString().toDoubleOrNull()?.toInt() != season.toIntOrNull() ||
+                                                    itemEp.toString().toDoubleOrNull()?.toInt() != episode.toIntOrNull()) {
+                                                    continue
+                                                }
+                                            }
+                                        }
+                                        val streamUrl = (resItem["resourceLink"] ?: resItem["downloadUrl"])?.toString()
+                                        if (!streamUrl.isNullOrEmpty()) {
+                                            val resVal = resItem["resolution"]?.toString() ?: "Auto"
+                                            streams.add(mutableMapOf(
+                                                "url" to streamUrl,
+                                                "quality" to if (resVal.endsWith("p")) resVal else "${resVal}p",
+                                                "signCookie" to (det["signCookie"] ?: resItem["signCookie"] ?: globalCookie ?: ""),
+                                                "codec" to (resItem["codecName"] ?: det["codecName"] ?: ""),
+                                                "id" to (resItem["resourceId"] ?: det["resourceId"] ?: ""),
+                                                "duration" to (resItem["duration"] ?: det["duration"] ?: 0)
+                                            ))
+                                        }
+                                    }
+                                }
+                                if (streams.isNotEmpty()) {
+                                    Log.i("LocalMovieBoxServer", "Recovered ${streams.size} streams directly from details resourceDetectors.")
+                                }
+                            } catch (e: Exception) {
+                                Log.e("LocalMovieBoxServer", "Error extracting from resourceDetectors", e)
+                            }
+                        }
 
                         // UGC BYPASS
                         var allDummy = true
@@ -911,7 +989,7 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
                                 }
 
                                 if (ugcStreams.isNotEmpty()) {
-                                    streams = ugcStreams
+                                    streams = ugcStreams.map { it.toMutableMap() }.toMutableList()
                                     Log.i("LocalMovieBoxServer", "UGC BYPASS SUCCESS: Recovered ${ugcStreams.size} REAL streams!")
                                 }
                             } catch (e: Exception) {
@@ -919,7 +997,14 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
                             }
                         }
 
-                        val prioritizedStreams = streams
+                        // Codec prioritization from api_server_download.txt (prefer H264 MP4 / HLS over HEVC)
+                        val prioritizedStreams = streams.sortedBy { st ->
+                            val u = (st["url"]?.toString() ?: "").lowercase()
+                            if (u.contains("h265") || u.contains("x265") || u.contains("hev1")) 10
+                            else if (u.endsWith(".mp4") || u.contains(".mp4?")) 0
+                            else if (u.endsWith(".m3u8") || u.contains(".m3u8?")) 1
+                            else 5
+                        }
                         val cleanedStreams = mutableListOf<Map<String, Any?>>()
                         for (st in prioritizedStreams) {
                             var url = st["url"]?.toString() ?: ""
@@ -956,6 +1041,32 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
                                     "cookie" to cookie,
                                     "size" to (st["size"] ?: st["fileSize"] ?: "Dynamic")
                                 ))
+                            }
+                        }
+
+                        // Fallback / Integration with AnimeDubHindiProvider
+                        val resolvedTitle = (detailData?.get("title") ?: detailData?.get("name"))?.toString() ?: ""
+                        if ((cleanedStreams.isEmpty() || resourceId == "animedubhindi" || resourceId?.contains("hindi", ignoreCase = true) == true) && resolvedTitle.isNotBlank()) {
+                            try {
+                                val animeProvider = AnimeDubHindiProvider(okHttpClient)
+                                val animeStreams = kotlinx.coroutines.runBlocking {
+                                    animeProvider.resolveStreamForTitle(
+                                        resolvedTitle,
+                                        season.toIntOrNull() ?: 1,
+                                        episode.toIntOrNull() ?: 1
+                                    )
+                                }
+                                for (asItem in animeStreams) {
+                                    cleanedStreams.add(mapOf(
+                                        "quality" to asItem.quality,
+                                        "url" to asItem.url,
+                                        "cookie" to asItem.cookie,
+                                        "size" to asItem.size,
+                                        "provider" to "AnimeDubHindi"
+                                    ))
+                                }
+                            } catch (e: Exception) {
+                                Log.w("LocalMovieBoxServer", "AnimeDubHindi stream fetch failed for $resolvedTitle: ${e.message}")
                             }
                         }
 

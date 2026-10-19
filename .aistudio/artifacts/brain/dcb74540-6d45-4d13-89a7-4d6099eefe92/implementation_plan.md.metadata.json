@@ -1,6 +1,6 @@
 {
-  "summary": "A comprehensive Product Requirements Document (PRD) and Implementation Plan for a Python (FastAPI) backend. This backend will serve as a high-performance proxy and scraper for official movie APIs, centralizing signature generation, data cleaning, and stream extraction logic for the Android app.",
-  "updatedAt": "2026-10-17T03:58:26.794072805Z",
+  "summary": "Revised implementation plan aligning strictly with user's requirement: metadata (trending, search, details) is completely decoupled and powered by TMDB, while the stream extraction logic from the provided file (api_server_download.txt) is exclusively used to resolve and load stream links into the video player.",
+  "updatedAt": "2026-10-19T04:55:56.611551966Z",
   "requestFeedback": true,
   "userFacing": true
 }
