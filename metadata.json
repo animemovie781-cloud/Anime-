@@ -1,0 +1,6 @@
+{
+  "name": "AnyFilm",
+  "description": "An Android application for movies, live TV, and streaming",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
