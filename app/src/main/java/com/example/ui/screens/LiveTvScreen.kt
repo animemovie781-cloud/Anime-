@@ -13,7 +13,9 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -64,6 +66,7 @@ import com.squareup.moshi.Moshi
 import com.squareup.moshi.Types
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -71,8 +74,9 @@ import okhttp3.Request
 import java.util.concurrent.TimeUnit
 
 private val liveHttpClient = OkHttpClient.Builder()
-    .connectTimeout(15, TimeUnit.SECONDS)
-    .readTimeout(20, TimeUnit.SECONDS)
+    .connectionPool(okhttp3.ConnectionPool(32, 5, TimeUnit.MINUTES))
+    .connectTimeout(12, TimeUnit.SECONDS)
+    .readTimeout(18, TimeUnit.SECONDS)
     .addInterceptor { chain ->
         val original = chain.request()
         val builder = original.newBuilder()
@@ -180,6 +184,55 @@ private fun fetchZioChannels(): Pair<Map<String, ZioChannelInfo>, Map<String, Zi
     return Pair(cachedZioChannels ?: emptyMap(), cachedZioChannelsByName ?: emptyMap())
 }
 
+private var cachedManishChannels: List<ManishWorkerChannelItem>? = null
+private var cachedManishById: Map<String, ManishWorkerChannelItem>? = null
+private var cachedManishByName: Map<String, ManishWorkerChannelItem>? = null
+private var manishCacheFetchTime: Long = 0L
+
+private fun fetchManishWorkerChannels(): Triple<List<ManishWorkerChannelItem>, Map<String, ManishWorkerChannelItem>, Map<String, ManishWorkerChannelItem>> {
+    val now = System.currentTimeMillis()
+    val existingList = cachedManishChannels
+    val existingById = cachedManishById
+    val existingByName = cachedManishByName
+    if (existingList != null && existingById != null && existingByName != null && (now - manishCacheFetchTime < 10 * 60 * 1000L)) {
+        return Triple(existingList, existingById, existingByName)
+    }
+
+    try {
+        val req = Request.Builder()
+            .url("https://jiotv-api.manishjaiswal.workers.dev/?t=$now")
+            .header("Cache-Control", "no-cache")
+            .build()
+        val resp = liveHttpClient.newCall(req).execute()
+        if (resp.isSuccessful) {
+            val body = resp.body?.string() ?: ""
+            val listType = Types.newParameterizedType(List::class.java, ManishWorkerChannelItem::class.java)
+            val adapter = moshi.adapter<List<ManishWorkerChannelItem>>(listType)
+            val list = adapter.fromJson(body) ?: emptyList()
+            val byId = mutableMapOf<String, ManishWorkerChannelItem>()
+            val byName = mutableMapOf<String, ManishWorkerChannelItem>()
+            for (item in list) {
+                val itemId = item.id?.trim()
+                if (!itemId.isNullOrBlank()) {
+                    byId[itemId] = item
+                }
+                val itemName = item.name?.trim()
+                if (!itemName.isNullOrBlank()) {
+                    val norm = itemName.lowercase().replace(Regex("[^a-z0-9]"), "")
+                    byName[norm] = item
+                }
+            }
+            cachedManishChannels = list
+            cachedManishById = byId
+            cachedManishByName = byName
+            manishCacheFetchTime = now
+            return Triple(list, byId, byName)
+        }
+    } catch (_: Exception) {}
+
+    return Triple(cachedManishChannels ?: emptyList(), cachedManishById ?: emptyMap(), cachedManishByName ?: emptyMap())
+}
+
 @OptIn(UnstableApi::class)
 @Composable
 fun LiveTvScreen(viewModel: com.example.ui.viewmodel.MovieViewModel? = null) {
@@ -238,79 +291,175 @@ fun LiveTvScreen(viewModel: com.example.ui.viewmodel.MovieViewModel? = null) {
         try {
             val fetchedChannels = withContext(Dispatchers.IO) {
                 if (selectedCountryCode == "IN_GEO") {
-                    // 1. Jio TV catalog (ClearKey DRM) - Filter out old FanCode items
-                    val req = Request.Builder().url("https://livetgtv.lovable.app/api/public/channels").build()
-                    val resp = liveHttpClient.newCall(req).execute()
-                    val body = resp.body?.string() ?: ""
-                    val adapter = moshi.adapter(LiveChannelListResponse::class.java)
-                    val jioList = adapter.fromJson(body)?.channels ?: emptyList()
-                    val jioChannels = jioList
-                        .filter { !it.category.equals("fancode", ignoreCase = true) && !it.id.startsWith("fc-") }
-                        .map {
-                            UnifiedChannel(
-                                id = it.id,
-                                name = it.name,
-                                logo = it.logo,
-                                category = it.category?.ifBlank { "Indian TV" } ?: "Indian TV",
-                                isJioTv = true
-                            )
+                    // Fetch Jio catalog, FanCode playlist, and Sony LIV playlist concurrently
+                    val jioDeferred = async {
+                        try {
+                            val req = Request.Builder().url("https://livetgtv.lovable.app/api/public/channels").build()
+                            val resp = liveHttpClient.newCall(req).execute()
+                            val body = resp.body?.string() ?: ""
+                            val adapter = moshi.adapter(LiveChannelListResponse::class.java)
+                            val jioList = adapter.fromJson(body)?.channels ?: emptyList()
+                            val channels = jioList
+                                .filter { !it.category.equals("fancode", ignoreCase = true) && !it.id.startsWith("fc-") }
+                                .distinctBy { it.id }
+                                .map {
+                                    val fullLogo = if (it.logo?.startsWith("/") == true) {
+                                        "https://livetgtv.lovable.app${it.logo}"
+                                    } else {
+                                        it.logo
+                                    }
+                                    UnifiedChannel(
+                                        id = it.id,
+                                        name = it.name,
+                                        logo = fullLogo,
+                                        category = it.category?.ifBlank { "Indian TV" } ?: "Indian TV",
+                                        isJioTv = true
+                                    )
+                                }
+                            Pair(channels, jioList)
+                        } catch (_: Exception) {
+                            Pair(emptyList<UnifiedChannel>(), emptyList<LiveChannelItem>())
                         }
-
-                    // 2. Fetch real-time auto-updated FanCode playlist via raw GitHub with cache-buster
-                    val fancodeChannels = try {
-                        val timestamp = System.currentTimeMillis()
-                        val fcUrl = "https://raw.githubusercontent.com/sayanpal514-hue/FANCODE-AUTO-UPDATED-PLAYLIST/main/fancode.m3u?t=$timestamp"
-                        val fcReq = Request.Builder()
-                            .url(fcUrl)
-                            .header("Cache-Control", "no-cache, no-store, must-revalidate")
-                            .header("Pragma", "no-cache")
-                            .build()
-                        val fcResp = liveHttpClient.newCall(fcReq).execute()
-                        if (fcResp.isSuccessful) {
-                            val fcBody = fcResp.body?.string() ?: ""
-                            parseM3uChannels(fcBody).map {
-                                it.copy(
-                                    category = "Fancode",
-                                    isJioTv = false
-                                )
-                            }
-                        } else {
-                            emptyList()
-                        }
-                    } catch (_: Exception) {
-                        emptyList()
                     }
 
-                    // 3. Fetch real-time auto-updated Sony LIV playlist via raw GitHub with cache-buster
-                    val sonyChannels = try {
-                        val timestamp = System.currentTimeMillis()
-                        val sonyUrl = "https://raw.githubusercontent.com/sportlive18/Sonyliv-Playlist-Autoupdate/main/sony.m3u?t=$timestamp"
-                        val sonyReq = Request.Builder()
-                            .url(sonyUrl)
-                            .header("Cache-Control", "no-cache, no-store, must-revalidate")
-                            .header("Pragma", "no-cache")
-                            .build()
-                        val sonyResp = liveHttpClient.newCall(sonyReq).execute()
-                        if (sonyResp.isSuccessful) {
-                            val sonyBody = sonyResp.body?.string() ?: ""
-                            parseM3uChannels(sonyBody).map { ch ->
-                                val mappedLogo = resolveSonyLogoFromJio(ch.name, jioList)
-                                    ?: ch.logo?.takeIf { it.isNotBlank() }
-                                    ?: getSonyChannelLogo(ch.name)
-                                ch.copy(
-                                    category = "Sony",
-                                    logo = mappedLogo,
-                                    isJioTv = false
-                                )
+                    val fancodeDeferred = async {
+                        try {
+                            val timestamp = System.currentTimeMillis()
+                            val fcUrl = "https://raw.githubusercontent.com/sayanpal514-hue/FANCODE-AUTO-UPDATED-PLAYLIST/main/fancode.m3u?t=$timestamp"
+                            val fcReq = Request.Builder()
+                                .url(fcUrl)
+                                .header("Cache-Control", "no-cache, no-store, must-revalidate")
+                                .header("Pragma", "no-cache")
+                                .build()
+                            val fcResp = liveHttpClient.newCall(fcReq).execute()
+                            if (fcResp.isSuccessful) {
+                                val fcBody = fcResp.body?.string() ?: ""
+                                parseM3uChannels(fcBody).map {
+                                    it.copy(
+                                        category = "Fancode",
+                                        isJioTv = false
+                                    )
+                                }
+                            } else {
+                                emptyList()
                             }
-                        } else {
+                        } catch (_: Exception) {
                             emptyList()
                         }
-                    } catch (_: Exception) {
-                        emptyList()
                     }
 
-                    jioChannels + fancodeChannels + sonyChannels
+                    val sonyDeferred = async {
+                        try {
+                            val timestamp = System.currentTimeMillis()
+                            val sonyUrl = "https://raw.githubusercontent.com/sportlive18/Sonyliv-Playlist-Autoupdate/main/sony.m3u?t=$timestamp"
+                            val sonyReq = Request.Builder()
+                                .url(sonyUrl)
+                                .header("Cache-Control", "no-cache, no-store, must-revalidate")
+                                .header("Pragma", "no-cache")
+                                .build()
+                            val sonyResp = liveHttpClient.newCall(sonyReq).execute()
+                            if (sonyResp.isSuccessful) {
+                                val sonyBody = sonyResp.body?.string() ?: ""
+                                parseM3uChannels(sonyBody)
+                            } else {
+                                emptyList()
+                            }
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
+                    }
+
+                    val manishDeferred = async {
+                        try {
+                            val (manishList, _, _) = fetchManishWorkerChannels()
+                            manishList.mapNotNull { item ->
+                                val name = item.name?.trim() ?: return@mapNotNull null
+                                val id = item.id?.trim()?.ifBlank { null }
+                                    ?: "mw-${name.lowercase().replace(Regex("[^a-z0-9]"), "-")}"
+                                val url = item.url?.trim() ?: ""
+                                if (url.isBlank()) return@mapNotNull null
+                                val rawCategory = item.category?.trim()?.ifBlank { null }
+                                    ?: item.cat?.trim()?.ifBlank { null }
+                                    ?: "General"
+                                val cleanCategory = when {
+                                    rawCategory.contains("sports", ignoreCase = true) -> "Sports"
+                                    rawCategory.contains("sunnxt", ignoreCase = true) -> "Entertainment"
+                                    rawCategory.contains("streamx", ignoreCase = true) -> "Entertainment"
+                                    rawCategory.equals("none", ignoreCase = true) || rawCategory.equals("unknown", ignoreCase = true) -> "General"
+                                    else -> rawCategory
+                                }
+                                UnifiedChannel(
+                                    id = id,
+                                    name = name,
+                                    logo = item.logo?.trim(),
+                                    category = cleanCategory,
+                                    streamUrl = url,
+                                    isJioTv = true,
+                                    directKeyId = item.keyId?.trim(),
+                                    directKey = item.key?.trim(),
+                                    directCookie = item.cookie?.trim(),
+                                    isDirectWorker = true
+                                )
+                            }
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
+                    }
+
+                    val (jioChannels, jioList) = jioDeferred.await()
+                    val fancodeChannels = fancodeDeferred.await()
+                    val rawSony = sonyDeferred.await()
+                    val manishChannels = manishDeferred.await()
+
+                    val mappedSonyChannels = rawSony.map { ch ->
+                        val mappedLogo = resolveSonyLogoFromJio(ch.name, jioList)
+                            ?: ch.logo?.takeIf { it.isNotBlank() }
+                            ?: getSonyChannelLogo(ch.name)
+                        ch.copy(
+                            category = "Sony",
+                            logo = mappedLogo,
+                            isJioTv = false
+                        )
+                    }
+
+                    val seenNormNames = mutableSetOf<String>()
+                    val mergedChannels = mutableListOf<UnifiedChannel>()
+
+                    // 1. Primary Lovable Jio channels
+                    for (ch in jioChannels) {
+                        val norm = ch.name.lowercase().replace(Regex("[^a-z0-9]"), "")
+                        if (norm.isNotBlank() && seenNormNames.add(norm)) {
+                            mergedChannels.add(ch)
+                        }
+                    }
+
+                    // 2. Manish worker channels (adds Sun TV network, ETV network, TNT Sports, and unique channels)
+                    for (ch in manishChannels) {
+                        val norm = ch.name.lowercase().replace(Regex("[^a-z0-9]"), "")
+                        if (norm.isNotBlank() && seenNormNames.add(norm)) {
+                            mergedChannels.add(ch)
+                        }
+                    }
+
+                    // 3. Sony LIV channels
+                    for (ch in mappedSonyChannels) {
+                        val norm = ch.name.lowercase().replace(Regex("[^a-z0-9]"), "")
+                        if (norm.isNotBlank() && seenNormNames.add(norm)) {
+                            mergedChannels.add(ch)
+                        }
+                    }
+
+                    // 4. FanCode channels
+                    for (ch in fancodeChannels) {
+                        val norm = ch.name.lowercase().replace(Regex("[^a-z0-9]"), "")
+                        if (norm.isNotBlank() && seenNormNames.add(norm)) {
+                            mergedChannels.add(ch)
+                        } else if (norm.isBlank()) {
+                            mergedChannels.add(ch)
+                        }
+                    }
+
+                    mergedChannels
                 } else {
                     // M3U stream catalog from iptv-org
                     val countryParam = selectedCountryCode.lowercase()
@@ -321,7 +470,7 @@ fun LiveTvScreen(viewModel: com.example.ui.viewmodel.MovieViewModel? = null) {
                         throw Exception("No playlist available for $selectedCountryName")
                     }
                     val m3uContent = resp.body?.string() ?: ""
-                    parseM3uChannels(m3uContent)
+                    parseM3uChannels(m3uContent).distinctBy { it.id to it.name }
                 }
             }
             channels = fetchedChannels
@@ -578,7 +727,7 @@ fun LiveTvScreen(viewModel: com.example.ui.viewmodel.MovieViewModel? = null) {
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    items(filteredChannels, key = { it.id + it.name }) { channel ->
+                    itemsIndexed(filteredChannels, key = { index, channel -> "${channel.id}_${channel.name}_$index" }) { _, channel ->
                         ChannelItemCard(
                             channel = channel,
                             onClick = {
@@ -672,7 +821,7 @@ private fun parseM3uChannels(content: String): List<UnifiedChannel> {
             currentGroup = "General"
         }
     }
-    return channels
+    return channels.distinctBy { it.id to it.name }
 }
 
 private fun resolveSonyLogoFromJio(name: String, jioList: List<LiveChannelItem>): String? {
@@ -776,7 +925,7 @@ fun ChannelItemCard(
                         contentDescription = channel.name,
                         modifier = Modifier
                             .fillMaxSize()
-                            .padding(6.dp),
+                            .padding(4.dp),
                         contentScale = ContentScale.Fit,
                         placeholder = androidx.compose.ui.graphics.painter.ColorPainter(Color(0xFF1E1E22)),
                         error = androidx.compose.ui.graphics.painter.ColorPainter(Color(0xFF1E1E22))
@@ -916,7 +1065,7 @@ fun SelectCountryDialog(
                             .weight(1f),
                         verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        items(filtered, key = { it.code + it.name }) { country ->
+                        itemsIndexed(filtered, key = { index, country -> "${country.code}_${country.name}_$index" }) { _, country ->
                             val isSelected = currentSelectedCode == country.code
                             Row(
                                 modifier = Modifier
@@ -1010,8 +1159,12 @@ fun UnifiedLiveTvPlayerDialog(
     val dialogView = LocalView.current
     val playerCoroutineScope = rememberCoroutineScope()
 
-    var attemptCount by remember { mutableStateOf(1) }
+    var attemptCount by remember(channel.id) { mutableStateOf(1) }
     var streamResolutionKey by remember { mutableStateOf(0L) }
+
+    LaunchedEffect(channel.id) {
+        attemptCount = 1
+    }
 
     var isResolving by remember { mutableStateOf(true) }
     var resolveError by remember { mutableStateOf<String?>(null) }
@@ -1235,8 +1388,78 @@ fun UnifiedLiveTvPlayerDialog(
                     var primaryApiSucceeded = false
                     var primaryApiError: Exception? = null
 
-                    // If attemptCount is 1, try primary Lovable API with 1 retry (total 2 attempts)
-                    if (attemptCount < 2) {
+                    // Branch A: Direct Worker channel (e.g. Sun TV network, ETV, TNT Sports from Manish Worker)
+                    if (channel.isDirectWorker && channel.streamUrl.isNotBlank() && attemptCount < 2) {
+                        url = channel.streamUrl
+
+                        // Parse DRM ClearKey(s)
+                        val dKeyId = channel.directKeyId
+                        val dKey = channel.directKey
+                        if (!dKeyId.isNullOrBlank() && dKeyId.contains(":")) {
+                            dKeyId.split(",").forEach { pair ->
+                                val parts = pair.split(":")
+                                if (parts.size == 2 && parts[0].isNotBlank() && parts[1].isNotBlank()) {
+                                    keysMap[parts[0].trim()] = parts[1].trim()
+                                }
+                            }
+                        } else if (!dKeyId.isNullOrBlank() && !dKey.isNullOrBlank()) {
+                            keysMap[dKeyId] = dKey
+                        }
+
+                        // Fallback to ClearKey database lookup if empty
+                        if (keysMap.isEmpty()) {
+                            val match = fallbackKeysCache?.find { it.id == channel.id }
+                            if (match != null) {
+                                if (!match.keyId.isNullOrBlank() && !match.key.isNullOrBlank()) {
+                                    keysMap[match.keyId] = match.key
+                                }
+                                match.keys?.forEach { pair ->
+                                    if (!pair.keyId.isNullOrBlank() && !pair.key.isNullOrBlank()) {
+                                        keysMap[pair.keyId] = pair.key
+                                    }
+                                }
+                            }
+                        }
+
+                        // Extract token or borrow active token for Jio CDN streams
+                        var token = if (url.contains("__hdnea__")) {
+                            url.substringAfter("__hdnea__=").substringBefore("&")
+                        } else if (!channel.directCookie.isNullOrBlank() && channel.directCookie.contains("__hdnea__=") && !channel.directCookie.contains("error code")) {
+                            channel.directCookie.substringAfter("__hdnea__=").substringBefore(";").trim()
+                        } else ""
+
+                        if (token.isBlank() && (url.contains("jio.com") || url.contains("bpk-tv"))) {
+                            val (zioById, _) = fetchZioChannels()
+                            val liveZioToken = zioById.values.firstNotNullOfOrNull { it.token?.takeIf { t -> t.isNotBlank() } }
+                            if (!liveZioToken.isNullOrBlank()) {
+                                token = liveZioToken
+                            } else {
+                                try {
+                                    val cReq = Request.Builder().url("https://allinonereborn2.online/jstrweb2/cookies.json").build()
+                                    val cResp = liveHttpClient.newCall(cReq).execute()
+                                    val cBody = cResp.body?.string() ?: ""
+                                    val listType = Types.newParameterizedType(List::class.java, Map::class.java)
+                                    val mapAdapter = moshi.adapter<List<Map<String, Any>>>(listType)
+                                    val cookieList = mapAdapter.fromJson(cBody)
+                                    val fullCookie = cookieList?.firstNotNullOfOrNull { it["cookie"] as? String }
+                                    if (!fullCookie.isNullOrBlank()) {
+                                        token = fullCookie.substringAfter("__hdnea__=").trim()
+                                    }
+                                } catch (_: Exception) {}
+                            }
+                        }
+
+                        if (token.isNotBlank() && !url.contains("__hdnea__")) {
+                            val sep = if (url.contains("?")) "&" else "?"
+                            url = "$url${sep}__hdnea__=$token"
+                        }
+
+                        primaryApiSucceeded = true
+                    }
+
+                    // Branch B: Standard Jio channel
+                    // 1st PRIORITY: Lovable API (if attemptCount == 1 and not already resolved)
+                    if (!primaryApiSucceeded && attemptCount < 2) {
                         for (apiAttempt in 1..2) {
                             try {
                                 val req = Request.Builder()
@@ -1255,7 +1478,7 @@ fun UnifiedLiveTvPlayerDialog(
                                     url.substringAfter("__hdnea__=").substringBefore("&")
                                 } else ""
 
-                                if (token.isBlank()) {
+                                if (token.isBlank() && (url.contains("jio.com") || url.contains("bpk-tv"))) {
                                     try {
                                         val cReq = Request.Builder().url("https://allinonereborn2.online/jstrweb2/cookies.json").build()
                                         val cResp = liveHttpClient.newCall(cReq).execute()
@@ -1325,7 +1548,55 @@ fun UnifiedLiveTvPlayerDialog(
                         }
                     }
 
-                    // Fallback: If Lovable API failed after 1 retry, or if attemptCount >= 2 (playback error on Lovable stream)
+                    // 2nd PRIORITY (Fallback): Manish Worker API
+                    if (!primaryApiSucceeded || url == null) {
+                        try {
+                            val (_, mById, mByName) = fetchManishWorkerChannels()
+                            val normName = channel.name.lowercase().replace(Regex("[^a-z0-9]"), "")
+                            val matchedManish = mById[channel.id] ?: mByName[normName]
+
+                            if (matchedManish != null && !matchedManish.url.isNullOrBlank()) {
+                                var mUrl = matchedManish.url.trim()
+                                val mKeyId = matchedManish.keyId?.trim()
+                                val mKey = matchedManish.key?.trim()
+
+                                if (!mKeyId.isNullOrBlank() && mKeyId.contains(":")) {
+                                    mKeyId.split(",").forEach { pair ->
+                                        val parts = pair.split(":")
+                                        if (parts.size == 2 && parts[0].isNotBlank() && parts[1].isNotBlank()) {
+                                            keysMap[parts[0].trim()] = parts[1].trim()
+                                        }
+                                    }
+                                } else if (!mKeyId.isNullOrBlank() && !mKey.isNullOrBlank()) {
+                                    keysMap[mKeyId] = mKey
+                                }
+
+                                var token = if (mUrl.contains("__hdnea__")) {
+                                    mUrl.substringAfter("__hdnea__=").substringBefore("&")
+                                } else if (!matchedManish.cookie.isNullOrBlank() && matchedManish.cookie.contains("__hdnea__=") && !matchedManish.cookie.contains("error code")) {
+                                    matchedManish.cookie.substringAfter("__hdnea__=").substringBefore(";").trim()
+                                } else ""
+
+                                if (token.isBlank() && (mUrl.contains("jio.com") || mUrl.contains("bpk-tv"))) {
+                                    val (zioById, _) = fetchZioChannels()
+                                    val liveZioToken = zioById.values.firstNotNullOfOrNull { it.token?.takeIf { t -> t.isNotBlank() } }
+                                    if (!liveZioToken.isNullOrBlank()) {
+                                        token = liveZioToken
+                                    }
+                                }
+
+                                if (token.isNotBlank() && !mUrl.contains("__hdnea__")) {
+                                    val sep = if (mUrl.contains("?")) "&" else "?"
+                                    mUrl = "$mUrl${sep}__hdnea__=$token"
+                                }
+
+                                url = mUrl
+                                primaryApiSucceeded = true
+                            }
+                        } catch (_: Exception) {}
+                    }
+
+                    // 3rd PRIORITY (Final Fallback): zio.m3u
                     if (!primaryApiSucceeded || url == null) {
                         val (zioById, zioByName) = fetchZioChannels()
                         val normName = channel.name.lowercase().replace(Regex("[^a-z0-9]"), "")
@@ -1342,7 +1613,7 @@ fun UnifiedLiveTvPlayerDialog(
                             keysMap.clear()
                             keysMap.putAll(matchedZio.keysMap)
                         } else {
-                            throw primaryApiError ?: Exception("Failed to resolve channel from primary API and backup zio.m3u")
+                            throw primaryApiError ?: Exception("Failed to resolve channel from primary API, backup worker, and zio.m3u")
                         }
                     }
 
@@ -1926,13 +2197,14 @@ fun UnifiedLiveTvPlayerDialog(
                                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                                         contentPadding = PaddingValues(horizontal = 2.dp)
                                     ) {
-                                        items(channels, key = { it.id + it.name }) { ch ->
+                                        itemsIndexed(channels, key = { index, ch -> "${ch.id}_${ch.name}_$index" }) { _, ch ->
                                             val isCurrent = ch.id == channel.id
                                             Card(
                                                 modifier = Modifier
                                                     .width(115.dp)
                                                     .height(72.dp)
                                                     .clickable {
+                                                        attemptCount = 1
                                                         onSelectChannel(ch)
                                                         showChannelDrawer = false
                                                     },
